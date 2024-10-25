@@ -1,0 +1,38 @@
+library(phytools)
+library(ape)
+
+# Create the data frame using the coordinates from MorphoJ
+df <- data.frame("Axis 1" = c(0.026377, -0.01661, 0.010484, -0.0069), "Axis 2" = c(0.013755, -0.01142, 0.012476, -0.00069))
+
+# Set row names for species
+rownames(df) <- c("camelopardalis", "giraffa", "reticulata", "tippelskirchi")
+summary(df)
+
+# Read the tree that has been created in Mesquite
+Tree <- read.tree("D:/Giraffa 3D GM/Results/GM/G/Plots 24-6/CVA/Species/Species.txt")
+summary(Tree)
+Tree$edge.length[is.na(Tree$edge.length) | is.nan(Tree$edge.length)] <- 0.2
+
+phylomorphospace(Tree, df, ftype="off", node.size=c(0,1.2), xlab="CV1", ylab="CV2")
+
+
+
+
+
+
+library(phytools)
+library(ape)
+
+# Create the data frame using the coordinates from MorphoJ
+df <- data.frame("Axis 1" = c(-5.1, -5.3, -6.0, 4.8, 4.7, -2.7, -2.7, -1.1), "Axis 2" = c(-1.7, -2.2, -0.7, -0.4, -0.7, -2.9, 9.6, 2.0))
+
+# Set row names for subspecies
+rownames(df) <- c("antiquorum", "camelopardalis", "peralta", "angolensis", "giraffa", "reticulata", "thornicrofti", "tippelskirchi")
+summary(df)
+
+# Read the tree that has been created in Mesquite
+Tree <- read.tree("D:/Giraffa 3D GM/Results/GM/G/Plots 24-6//Subspecies/Subspecies.txt")
+Tree$edge.length[is.na(Tree$edge.length) | is.nan(Tree$edge.length)] <- 0.2
+summary(Tree)
+
+phylomorphospace(Tree, df, ftype="off", node.size=c(0,1.2), xlab="CV1", ylab="CV2")
