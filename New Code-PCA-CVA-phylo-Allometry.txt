@@ -1,0 +1,2393 @@
+############################################################ 
+## Giraffe skulls 3D GM — Classifiers + PCA/CVA/Allometry
+## Robust single-file pipeline (Steps 0–11)
+############################################################
+
+############################################################ 
+## (0) Packages --------------------------------------------------------------
+############################################################ 
+# Prefer CRAN binaries on Windows
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+options(install.packages.check.source = "no")
+
+pkgs <- c(
+  "geomorph","Morpho","ape","phytools","ggplot2",
+  "openxlsx","dplyr","tibble","MASS","wesanderson",
+  "scales","ggrepel","RRPP","ggforce",
+  "car","biotools","rgl"
+)
+
+# install once if missing; otherwise just load
+need <- setdiff(pkgs, rownames(installed.packages()))
+if (length(need)) install.packages(need, dependencies = TRUE)
+
+invisible(lapply(pkgs, require, character.only = TRUE))
+
+
+############################################################ 
+## (1) Paths -----------------------------------------------------------------
+############################################################ 
+lm_dir <- "E:/Giraffa 3D GM/Results/GM/G"  # <- adjust if needed
+stopifnot(dir.exists(lm_dir))
+A_complete_path       <- file.path(lm_dir, "Giraffa_complete.txt")
+A_adults_path         <- file.path(lm_dir, "Giraffa_adults.txt")
+A_adults_males_path   <- file.path(lm_dir, "Giraffa_adults_males.txt")
+A_adults_females_path <- file.path(lm_dir, "Giraffa_adults_females.txt")
+stopifnot(file.exists(A_complete_path),
+          file.exists(A_adults_path),
+          file.exists(A_adults_males_path),
+          file.exists(A_adults_females_path))
+
+base_out <- file.path(lm_dir, "ANALYSES")
+dir.create(base_out, recursive = TRUE, showWarnings = FALSE)
+
+# ---- helper: pretty "Complete" subfolder name for adult sets ----
+.complete_subfolder_name <- function(sample_name) {
+  switch(sample_name,
+    "c_adult_males"   = "Adult Males Complete",
+    "d_adult_females" = "Adult Females Complete",
+    NULL
+  )
+}
+
+# === Trees: read, harmonize labels, and ensure branch lengths ================
+tree_species_path    <- file.path(lm_dir, "Tree_species.nex")
+tree_subspecies_path <- file.path(lm_dir, "Tree_subspecies.nex")
+
+normalize_str <- function(x){
+  x <- tolower(trimws(as.character(x)))
+  gsub("\\s+"," ", x)
+}
+
+# mappers (species & subspecies keys used by palettes and tree tips)
+map_species_key <- function(level){
+  s <- normalize_str(level)
+  if (s %in% c("cam","ret","tip","gir","sp.")) return(s)
+  if (grepl("camelopardalis", s)) return("cam")
+  if (grepl("reticulata",     s)) return("ret")
+  if (grepl("tippel|tippelskirchi", s)) return("tip")
+  if (grepl("^gir(affa)?$",   s)) return("gir")
+  if (s %in% c("sp","sp."))   return("sp.")
+  NA_character_
+}
+
+map_subspecies_key <- function(level){
+  s <- normalize_str(level)
+  # canonical keys you actually plot by
+  if (s %in% c("cam","ant","per","ret","tip","thor","gir","ang",
+               "gir. subsp.","cam. subsp.","sp. subsp.")) return(s)
+  # exact/partial names -> keys
+  if (grepl("camelopardalis", s) && grepl("subsp", s)) return("cam. subsp.")  # placeholder
+  if (grepl("camelopardalis", s)) return("cam")                               # real cam subspecies
+  if (grepl("antiquorum", s))    return("ant")
+  if (grepl("peralta", s))       return("per")
+  if (grepl("angolensis", s))    return("ang")
+  if (grepl("thornicrofti", s))  return("thor")
+  if (grepl("^cam$", s))         return("cam")
+  if (grepl("^gir(affa)?$", s) && grepl("subsp", s)) return("gir. subsp.")
+  if (grepl("^gir(affa)?$", s))  return("gir")
+  if (grepl("tippel|tippelskirchi", s)) return("tip")
+  if (grepl("reticulata", s)) return("ret")
+  if (s %in% c("sp subsp","sp. subsp.","sp. subsp")) return("sp. subsp.")
+  NA_character_
+}
+
+# subspecies -> parent species key
+sub_to_species_key <- function(ssp_key) {
+  s <- normalize_str(ssp_key)
+  if (s %in% c("ang","gir","gir. subsp.")) return("gir")
+  if (s %in% c("ant","per","cam","cam. subsp.")) return("cam")
+  if (s %in% c("ret")) return("ret")
+  if (s %in% c("tip","thor")) return("tip")
+  if (s %in% c("sp. subsp.")) return("sp.")
+  NA_character_
+}
+
+rename_tree_tips <- function(tree, mapper){
+  if (is.null(tree)) return(NULL)
+  tips <- tree$tip.label
+  mapped <- vapply(tips, function(tx){
+    key <- mapper(tx)
+    ifelse(is.na(key), normalize_str(tx), key)
+  }, character(1))
+  tree$tip.label <- mapped
+  tree
+}
+
+ensure_branch_lengths <- function(tree, method = c("grafen","equal"),
+                                  make_ultrametric = TRUE, quiet = FALSE) {
+  if (is.null(tree)) return(NULL)
+  method <- match.arg(method)
+  has_bl <- !is.null(tree$edge.length) && all(is.finite(tree$edge.length))
+  if (!has_bl) {
+    if (!quiet) message("↪ Adding branch lengths (", method, ") to tree…")
+    if (method == "grafen") {
+      tree <- ape::compute.brlen(tree, method = "Grafen", power = 1)
+    } else {
+      tree <- ape::compute.brlen(tree)  # equal
+    }
+  }
+  if (make_ultrametric) {
+    if (!quiet) message("↪ Forcing ultrametric branch lengths (extend)…")
+    tree <- phytools::force.ultrametric(tree, method = "extend")
+  }
+  tree
+}
+
+Tree_Species    <- if (file.exists(tree_species_path))    ape::read.nexus(tree_species_path)    else NULL
+Tree_Subspecies <- if (file.exists(tree_subspecies_path)) ape::read.nexus(tree_subspecies_path) else NULL
+Tree_Species    <- ensure_branch_lengths(Tree_Species,    method = "grafen", make_ultrametric = TRUE)
+Tree_Subspecies <- ensure_branch_lengths(Tree_Subspecies, method = "grafen", make_ultrametric = TRUE)
+Tree_Species    <- if (!is.null(Tree_Species))    rename_tree_tips(Tree_Species,    map_species_key)    else NULL
+Tree_Subspecies <- if (!is.null(Tree_Subspecies)) rename_tree_tips(Tree_Subspecies, map_subspecies_key) else NULL
+
+# Optional: quick sanity print
+if (!is.null(Tree_Species))    message("Species tree tips: ",    paste(Tree_Species$tip.label, collapse=", "))
+if (!is.null(Tree_Subspecies)) message("Subspecies tree tips: ", paste(Tree_Subspecies$tip.label, collapse=", "))
+
+
+############################################################ 
+## (2) Read Morphologika arrays ---------------------------------------------
+############################################################ 
+A_complete       <- read.morphologika(A_complete_path)
+A_adults         <- read.morphologika(A_adults_path)
+A_adults_males   <- read.morphologika(A_adults_males_path)
+A_adults_females <- read.morphologika(A_adults_females_path)
+
+
+############################################################ 
+## (3) ==== CLASSIFIER VECTORS ============================
+############################################################ 
+ID_complete <- factor(c("1","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24","25","26","27","28","29","30","31","32","33","34","35","36","37","38","39","40","41","42","43","44","45","46","47","48","49","51","52","53","54","55","56","57","58","59","60","61","62","63","64","65","66","67","68","69","70","71","72","73","74","75","76","77","78","79","80","81","82","83","84","85","86","87","88","89","90","91","92","93","94","95","96","97","98","99","100","101","102","103","104","105","106","107","108","109","110","111","112","113","114","115","116","117","118","119","120","121","122","123","124","125","126","127","128","129","130","131","132","133","134","135","136","137","138","139","140","141","142","143","144","145","146","147","148","149","150","151","152","153","154","155","156","157","158","159","160","161","162","163","164","165","166","167","168","169","170","171","172","173","174","175","176","177","178","179","180","181","182","183","184","185","186","187","188","189","190","191","192","193","194","195","196","197","198","199","200","201","202","203","204","205","206","207","208","209","210","211","212","213","214","215","216","217","218","219","220","221","222","223","224","225","226","227","228","229","230","231","232","233","234","235","236","237","238","239","240","241","242","243","244","245","246","247","248","249","250","251","252","253","254","255","256","257","258","259","260","261","262","263","264","265","266","267","268","269","270","271","272","273","274","275","276","277","278","279","280","281","282","283","284","285","286","287","288","289","290","291","292","293","294","295","296","297","298","299","300","301","302","303","304","305","306","307","308","309","310","311","312","313","314","315","316","317","318","319","320","321","322","323","324","325","326","327","328","329","330","331","332","333","334","335","336","337","338","339","340","341","342","343","344","345","346","347","348","349","350","351","352","353","354","355","356","357","358","359","360","361","362","363","364","365","366","367","368","369","370","371","372","373","374","375","376","377","378","379","380","382","384","385","386","387","388","389","390","391","392","393","394","395","396","397","398","399","400","401","402","403","404","405","406","407","408","409","410","411","412","413","414","415","416","417","418","419","420","421","422","423","424","425","426","427","428","429","430","431","432","433","434","435","436","437","438","439","440","441","442","443","444","445","446","447","448","449","450","451","452","453","454","455","456","457","458","459","460","461","462","463","464","465","467","468","469","470","471","472","473","474","475","476","477","478","479","480","481","482","483","484","485","486","487","488","489","490","491","492","493","494","495","496","497","498","499","500"))
+
+ID_adults <- factor(c("1","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24","25","26","27","28","29","30","31","32","34","35","36","37","38","39","40","41","42","43","44","46","47","48","49","50","51","52","53","54","55","56","57","58","59","60","61","62","63","64","65","66","67","68","69","70","71","72","73","74","75","76","77","78","79","80","81","82","83","84","85","86","87","88","89","90","91","92","93","94","95","96","97","98","99","100","101","102","104","105","106","107","108","109","110","111","112","113","114","115","116","117","118","119","120","121","122","123","124","125","126","127","128","129","130","131","132","133","134","135","136","137","138","139","140","141","142","143","144","145","146","147","148","149","150","151","152","153","154","155","156","157","158","159","160","161","162","163","164","165","166","167","168","169","170","171","172","173","174","175","176","177","178","179","180","181","182","183","184","185","186","187","188","189","190","191","192","193","194","195","196","197","198","199","200","201","202","203","204","205","206","207","208","209","210","211","212","213","214","215","216","217","218","219","220","221","222","223","224","225","226","227","228","229","230","231","232","233","236","237","238","239","240","241","242","243","244","245","246","247","248","249","250","251","252","253","254","255","256","258","259","260","261","262","263","264","265","266","267","268","269","270","271","272","273","274","275","276","277","278","279","280","281","282","283","284","285","286","287","288","289","290","291","292","293","294","295","296","297","298","299","300","301","302","303","304","305","306","307","308","309","310","311","312","313","314","315","316","317","318","319","320","321","322","323","327","328","329","330","331","332","333","334","335","336","337","338","339","340","341","342","343","344","345","346","347","348","349","350","351","352","353","354","355","356","357","358","359","360","361","362","363","364","365","366","367","368","369","370","371","372","373","374","375","376","377","378","379","380","381","382","383","384","385","386","387","388","389","390","391","392","393","396","397","398","399","400","401","402","403","404","405","406","407","408","409","410","411","412","413","414"))
+
+ID_adults_males <- factor(c("1","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16","17","19","20","21","22","23","24","25","26","27","28","29","30","31","32","33","34","35","36","37","38","39","40","41","42","43","44","45","46","47","48","49","50","51","52","53","54","55","56","57","58","59","60","61","62","63","64","65","66","67","68","69","70","71","72","73","74","75","76","77","78","79","80","81","82","83","84","85","86","87","88","89","90","91","92","93","94","95","96","97","98","99","100","101","102","103","104","105","106","107","108","109","110","111","112","113","114","115","116","117","118","119","120","121","122","123","124","125","126","127","128","129","130","131","132","133","134","135","136","137","138","139","140","141","142","143","144","145","146","147","148","149","150","151","152","153","154","155","156","157","158","159","160","161","162","163","164","165","166","167","168","169","170","171","172","173","174","175","176","177","178","179","180","181","182","183","184","186","187","188","189","190","191","192","193","194","195","196","197","198","199","200","201","202","203","204","205","206","207","208","209","210","211","212","213","214","215","216","217","218","219","220","221","222","223","224","225","226","227","228","229","230","231","232","233","234","235","236","237","238","239","240","241","242","243","244","245","246","247","248","249","250","251","252","253","254","255","256","257","258","259","260","261","262","263","264","265","266","269","270","271","272","273","274","275","276","277","278","279","280","281","282","283","284","285","286","287"))
+
+ID_adults_females <- factor(c("1","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24","25","26","28","29","30","31","32","33","34","35","36","38","39","40","41","42","43","44","45","46","47","48","49","50","51","52","53","54","55","56","57","58","61","62","63","64","65","66","67","68","69","70","71","72","73","74","75","76","77","78","79","80","81","82","83","84","85","86","87","88","89","90","91","92","93","94","95","96","97","98","99","100","101","102","103","104","105","106","110","111","112","113","114","115","116","117","118","119","120","121","122","123","124","125","126","127"))
+
+
+Sex_complete <- factor(c("F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","F","F","F","F","F","F","F","F","F","F","F","F","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","F","F","F","M","M","M","M","F","F","F","F","F","M","M","M","M","M","M","M","F","F","F","F","F","F","F","F","F","F","F","F","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","X","X","X","X","F","F","F","F","F","F","M","M","M","M","M","M","M","M","M","F","F","F","F","F","F","F","F","F","F","F","F","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","X","X","F","F","F","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","X","X","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","X","X","X","X"))
+
+Sex_adults <- factor(c("F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","F","F","F","F","F","F","F","F","F","F","F","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","F","F","F","M","M","M","M","F","F","F","M","M","M","M","M","M","M","F","F","F","F","F","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","F","F","F","M","M","M","M","M","M","M","M","M","F","F","F","F","F","F","F","F","F","F","F","F","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","F","F","F","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M","M"))
+
+
+Species_complete <- factor(c("ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","per","per","per","per","per","per","per","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp."))
+
+Species_adults <- factor(c("cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp."))
+
+Species_adults_males <- factor(c("cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp."))
+
+Species_adults_females <- factor(c("cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp.","sp."))
+
+
+Subspecies_complete <- factor(c("ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","per","per","per","per","per","per","per","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp."))
+
+Subspecies_adults <- factor(c("ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","per","per","per","per","per","per","per","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp."))
+
+Subspecies_adults_males <- factor(c("ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","per","per","per","per","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","cam. subsp.","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","ang","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","gir. subsp.","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","thor","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp."))
+
+Subspecies_adults_females <- factor(c("ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","ant","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","cam","per","per","per","cam. subsp.","cam. subsp.","cam. subsp.","ang","ang","ang","ang","ang","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir","gir. subsp.","gir. subsp.","gir. subsp.","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","ret","thor","thor","thor","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","tip","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp.","sp. subsp."))
+
+
+
+Age_complete <- factor(c("B","D","D","D","E","E","E","E","E","E","E","E","F","F","G","I","B","B","B","E","E","E","E","E","E","E","F","F","F","G","H","X","X","X","X","X","X","A","D","E","D","E","F","F","F","G","H","I","X","A","A","A","A","D","E","E","E","E","E","E","F","F","F","F","F","F","F","F","F","F","F","F","F","G","G","G","H","I","I","X","X","X","X","X","X","X","X","X","X","X","E","H","I","E","F","F","X","B","B","D","D","F","E","E","F","F","G","G","I","B","B","B","C","C","C","D","D","D","D","G","F","C","C","E","E","E","E","E","E","E","E","E","E","E","E","E","E","E","F","F","F","F","F","F","F","F","G","G","G","X","X","X","A","B","B","B","C","C","C","C","C","C","D","D","D","D","D","E","E","E","F","F","F","F","F","F","G","X","A","A","A","B","B","B","B","B","C","D","D","D","D","D","E","E","E","E","E","E","E","E","E","E","E","E","E","E","E","E","E","E","E","E","E","F","E","E","E","E","E","E","E","E","E","E","E","E","E","E","E","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","F","G","G","G","G","G","G","H","H","I","X","X","X","X","X","X","X","A","A","A","B","A","D","E","G","X","X","E","E","E","F","F","F","F","F","F","D","D","E","D","E","F","F","F","F","G","G","G","A","B","D","E","E","E","E","E","E","E","F","F","F","F","F","F","G","H","H","H","A","A","F","G","X","B","B","D","E","X","X","X","X","X","X","X","X","X","X","X","X","X","B","B","B","B","C","C","C","C","D","D","D","D","D","E","E","E","E","F","F","F","F","F","F","F","F","F","F","F","G","G","G","G","G","G","G","H","H","H","X","X","X","A","A","A","B","B","B","B","B","D","E","E","E","E","E","E","E","E","E","E","E","E","E","E","F","F","F","F","F","F","F","F","F","F","F","F","G","G","G","G","G","G","G","H","H","H","H","I","I","X","X","X","X","X","X","X","X","X","A","B","A","B","B","C","D","D","D","D","E","F","F","F","G","G","I","I","I","X","X","X","X","A","A","A","B","B","B","B","B","B","B","D","D","E","E","E","E","E","E","F","F","F","G","H","I","I","I","I","X","X","X","X","A","B","B","C"))
+
+
+North_South_complete <- factor(c("North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X"))
+
+North_South_adults <- factor(c("North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X"))
+
+North_South_adults_males <- factor(c("North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X"))
+
+North_South_adults_females <- factor(c("North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","North","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","North","North","North","North","North","North","North","North","North","North","North","North","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","South","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X","X"))
+
+
+
+## Safety check — verify classifiers exist
+needed_objs <- c(
+  "ID_complete","ID_adults","ID_adults_males","ID_adults_females",
+  "Species_complete","Species_adults","Species_adults_males","Species_adults_females",
+  "Subspecies_complete","Subspecies_adults","Subspecies_adults_males","Subspecies_adults_females",
+  "Sex_complete","Sex_adults","Age_complete",
+  "North_South_complete","North_South_adults","North_South_adults_males","North_South_adults_females"
+)
+missing <- needed_objs[!vapply(needed_objs, exists, logical(1))]
+if (length(missing)) stop("Missing classifier vectors: ", paste(missing, collapse=", "),
+                          "\n→ Paste them in section (3).")
+
+
+############################################################ 
+## (4) Attach IDs to arrays + build metadata --------------------------------
+############################################################ 
+as_chr <- function(x) trimws(as.character(x))
+set_ids <- function(A, ids){
+  dn <- dimnames(A); if (is.null(dn)) dn <- vector("list",3)
+  dn[[3]] <- as_chr(ids); dimnames(A) <- dn; A
+}
+# sanity check lengths
+stopifnot(length(ID_complete)       == dim(A_complete)[3],
+          length(ID_adults)         == dim(A_adults)[3],
+          length(ID_adults_males)   == dim(A_adults_males)[3],
+          length(ID_adults_females) == dim(A_adults_females)[3])
+
+A_complete       <- set_ids(A_complete,       ID_complete)
+A_adults         <- set_ids(A_adults,         ID_adults)
+A_adults_males   <- set_ids(A_adults_males,   ID_adults_males)
+A_adults_females <- set_ids(A_adults_females, ID_adults_females)
+
+mk_meta <- function(ids, Species=NULL, Subspecies=NULL, Sex=NULL, Age=NULL, Region=NULL){
+  tibble::tibble(
+    ID = as_chr(ids),
+    Species    = if (!is.null(Species))    factor(Species)    else factor(NA),
+    Subspecies = if (!is.null(Subspecies)) factor(Subspecies) else factor(NA),
+    Sex        = if (!is.null(Sex))        factor(Sex)        else factor(NA),
+    Age        = if (!is.null(Age))        factor(Age)        else factor(NA),
+    Region     = if (!is.null(Region))     factor(Region)     else factor(NA)
+  )
+}
+meta_complete <- mk_meta(ID_complete, Species_complete, Subspecies_complete, Sex_complete, Age_complete, North_South_complete)
+meta_adults   <- mk_meta(ID_adults, Species_adults, Subspecies_adults, Sex_adults, NULL, North_South_adults)
+meta_males    <- mk_meta(ID_adults_males, Species_adults_males, Subspecies_adults_males, factor("M", levels=c("M","F","X")), NULL, North_South_adults_males)
+meta_females  <- mk_meta(ID_adults_females, Species_adults_females, Subspecies_adults_females, factor("F", levels=c("M","F","X")), NULL, North_South_adults_females)
+
+
+############################################################ 
+## (5) Missing-data TPS  + sliders -------------------------------------------
+############################################################ 
+impute_tps <- function(A, label){ cat("TPS-impute:", label, "\n"); estimate.missing(A, method="TPS") }
+A_complete  <- impute_tps(A_complete, "complete")
+A_adults    <- impute_tps(A_adults, "adults")
+A_ad_males  <- impute_tps(A_adults_males, "adult_males")
+A_ad_fem    <- impute_tps(A_adults_females, "adult_females")
+
+make_curve_windows <- function(from=43, to=119, width=4, step=3){
+  starts <- seq(from, to - width + 1, by = step)
+  lapply(starts, function(s) s:(s+width-1))
+}
+curves_idx <- make_curve_windows(43,119,4,3)
+sliders <- do.call(rbind, lapply(curves_idx, define.sliders))
+
+
+# Global GPA on complete dataset (use the SAME sliders!)
+GP_GLOBAL <- geomorph::gpagen(A_complete, curves = sliders,
+                              ProcD = FALSE, print.progress = FALSE, PrinAxes = FALSE)
+COORDS_COMPLETE_GPA <- GP_GLOBAL$coords  # (p x k x n_full)
+
+############################################################ 
+## (6) Palettes & constants
+############################################################ 
+species_cols_master <- c(
+  cam = "chartreuse4", ret = "brown4", tip = "darkgoldenrod1",
+  gir = "deepskyblue2", "sp." = "antiquewhite4"
+)
+subspecies_cols_master <- c(
+  cam = "chartreuse4", ant = "darkgreen", per = "darkolivegreen3",
+  "cam. subsp." = "darkolivegreen4",  # placeholder (excluded from subspecies CVA/phylo)
+  ret = "brown4", tip = "darkgoldenrod1", thor = "chocolate2",
+  gir = "deepskyblue2", ang = "deepskyblue4", "gir. subsp." = "deepskyblue3",
+  "sp. subsp." = "antiquewhite4"
+)
+region_cols <- c(North = "chartreuse4", South = "deepskyblue2")
+sex_cols    <- c(M = "deepskyblue3", F = "coral3", X = "antiquewhite4")
+age_ramp    <- rev(wesanderson::wes_palette("Zissou1", 10, type = "continuous"))
+
+
+############################################################
+## (7) Helper mappers reused later
+############################################################
+safe_write_txt <- function(lines, path) {
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+  con <- file(path, open = "wt", encoding = "UTF-8")
+  on.exit(try(close(con), silent = TRUE), add = TRUE)
+  writeLines(lines, con, useBytes = TRUE)
+}
+
+
+# Keep E–I as adults; keep X for plots (but exclude X from pairwise)
+normalize_age_adult_dual <- function(Age) {
+  a <- toupper(trimws(as.character(Age)))
+  a[a %in% c("", "NA", "N/A", "UNKNOWN")] <- NA
+  # Reduce to first letter A..I or X if present
+  a <- sub("^([A-I]|X).*$", "\\1", a)
+  # Drop juveniles A–D entirely
+  a[a %in% c("A","B","C","D")] <- NA
+
+  # For plotting: allow X to stay
+  Age_plot <- factor(a, levels = c("E","F","G","H","I","X"))
+  # For pairwise: E–I only
+  Age_pw   <- factor(ifelse(a %in% c("E","F","G","H","I"), a, NA),
+                     levels = c("E","F","G","H","I"))
+  list(plot = Age_plot, pairwise = Age_pw)
+}
+
+# Normalize Age values to a clean factor (trim, uppercase, map placeholders to NA)
+.normalize_age <- function(x){
+  y <- toupper(trimws(as.character(x)))
+  # common placeholders → NA
+  y[y %in% c("", "NA", "N/A", "NULL", "UNK", "UNKNOWN", "-", "X")] <- NA
+  # keep the FIRST letter if it is A..I (tolerate things like "E ", "E-adult")
+  y <- sub("^\\s*([A-I]).*$", "\\1", y, perl = TRUE)
+  # anything not a single A..I becomes NA
+  y[!grepl("^[A-I]$", y)] <- NA
+  # ordered factor A..I (A<B<…<I)
+  factor(y, levels = LETTERS[1:9], ordered = TRUE)
+}
+
+
+species_from_any <- function(Species, Subspecies){
+  s <- map_species_key(Species)
+  if (!is.na(s) && s != "sp.") return(s)
+  ss <- map_subspecies_key(Subspecies)
+  sub_to_species_key(ss)
+}
+make_species_plot_factor <- function(meta_df){
+  sp <- vapply(seq_len(nrow(meta_df)), function(i){
+    species_from_any(meta_df$Species[i], meta_df$Subspecies[i])
+  }, FUN.VALUE = character(1))
+  factor(sp, levels = c("cam","ret","tip","gir","sp."))
+}
+
+## groups for which we never draw convex hulls
+HULL_EXCLUDE <- c("X","sp.","sp. subsp.","gir. subsp.","cam. subsp.")
+
+
+# ---------- PROCRUSTES FRAME HELPERS (no rotonto) ----------
+.unitize_land <- function(M){
+  M <- as.matrix(M)
+  ctr <- colMeans(M)
+  M0  <- sweep(M, 2, ctr, "-")
+  cs  <- sqrt(sum(rowSums(M0^2)))
+  list(unit = M0/cs, ctr = ctr, cs = cs)
+}
+
+# Orthogonal Procrustes (A→B) via SVD; A,B are p×k (k=3)
+.procrustes_R <- function(A, B){
+  # find R minimizing ||A R - B||
+  X <- t(A) %*% B
+  sv <- svd(X)
+  R  <- sv$u %*% t(sv$v)
+  # enforce right-handed rotation (no reflection)
+  if (det(R) < 0) {
+    sv$u[, ncol(sv$u)] <- -sv$u[, ncol(sv$u)]
+    R <- sv$u %*% t(sv$v)
+  }
+  R
+}
+
+# Build inverse mapping from GPA space back to raw, using a single specimen
+.procrustes_frame <- function(ref_raw, ref_gpa){
+  uu <- .unitize_land(ref_raw)
+  R  <- .procrustes_R(uu$unit, ref_gpa)
+  list(
+    inv = function(Mg){  # GPA -> raw
+      (Mg %*% t(R)) * uu$cs + matrix(uu$ctr, nrow(Mg), ncol(Mg), byrow = TRUE)
+    }
+  )
+}
+
+
+
+
+############################################################
+## (8) Helpers used by the runner (+ PCA/CVA WARPS)
+############################################################
+
+
+# Map a CVA "stem" → subfolder name used on disk
+.stem_subdir <- function(stem) {
+  s <- as.character(stem)[1]
+  if (is.na(s) || !nzchar(s)) s <- "CVA"
+  switch(tolower(s),
+    species    = "Species",
+    subspecies = "Subspecies",
+    region     = "Region",
+    sex        = "Sex",
+    age        = "Age",
+    tools::toTitleCase(s)  # fallback
+  )
+}
+
+# MorphoJ/LE-compatible two-shape Morphologika writer (CRLF, no [data])
+.write_morphologika_dta_two_LE <- function(
+  M_start, M_end, file,
+  dataset_label,          # e.g., "Adult Males Complete"
+  analysis_label,         # e.g., "PC1 negative" (second name becomes PC1_negative)
+  scale_factor = 1.00     # purely informational for LE; numeric required
+){
+  stopifnot(is.matrix(M_start), is.matrix(M_end), all(dim(M_start) == dim(M_end)))
+  p <- nrow(M_start); k <- ncol(M_start)
+  coord_count <- p * k
+  dir.create(dirname(file), recursive = TRUE, showWarnings = FALSE)
+
+  # second shape name (underscored)
+  name2 <- gsub("[[:space:]]+", "_", analysis_label)
+
+  # binary write to enforce CRLF and avoid BOM surprises
+  con <- file(file, open = "wb"); on.exit(close(con), add = TRUE)
+  w <- function(x) writeBin(charToRaw(paste0(x, "\r\n")), con)
+
+  # MorphoJ-like preamble (three quoted lines)
+  w(paste0("'", dataset_label))
+  w(sprintf("'The scale factor used for the shape change is %.6f", scale_factor))
+  w("'Generated by R (Morphologika two-shape export)")
+
+  # header line
+  w(sprintf("1 2L 357 1 9999 Dim=3", coord_count, k))
+  w("")
+
+  # shape names (no [data] line)
+  w("starting_shape")
+  w(name2)
+  w("")
+
+  # coordinates: uppercase E, 8 decimals, space-separated
+  fmt <- paste(rep("%.8E", k), collapse = " ")
+  wr_coords <- function(M) apply(M, 1, function(row) w(do.call(sprintf, c(fmt, as.list(row)))))
+
+  wr_coords(M_start)
+  w("")
+  wr_coords(M_end)
+  invisible(TRUE)
+}
+
+
+# Allometry: log(CS) vs PC1 proxy, with Age/Sex plots + pairwise + procD.lm
+run_allometry_11 <- function(coords_gpa, Csize, meta_df, allom_dir,
+                             sample_name, sex_cols, age_pal) {
+  dir.create(allom_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # ---------- PC1 proxy axis ----------
+  df <- data.frame(logCS = log(Csize))
+  pca_tmp <- geomorph::gm.prcomp(coords_gpa)
+  df$Axis1 <- as.numeric(pca_tmp$x[, 1])
+  if ("Age" %in% names(meta_df)) df$Age <- meta_df$Age
+  if ("Sex" %in% names(meta_df)) df$Sex <- meta_df$Sex
+
+  # ---------- helpers ----------
+  .lm_r2_slope <- function(dat) {
+    fit <- lm(Axis1 ~ logCS, data = dat)
+    s   <- summary(fit)
+    data.frame(
+      n         = nrow(dat),
+      intercept = unname(coef(fit)[1]),
+      slope     = unname(coef(fit)[2]),
+      R2        = unname(s$r.squared),
+      p_slope   = unname(coef(s)[2, "Pr(>|t|)"]),
+      stringsAsFactors = FALSE
+    )
+  }
+  .per_group <- function(dat, grp) {
+  sp  <- split(dat, grp)
+  out <- lapply(names(sp), function(g) {
+    if (nrow(sp[[g]]) >= 2) cbind(group = g, .lm_r2_slope(sp[[g]])) else NULL
+  })
+  out <- Filter(Negate(is.null), out)
+  if (!length(out)) return(NULL)
+  do.call(rbind, out)
+}
+
+  # ---------- OVERALL (PC1 ~ logCS) ----------
+  write_xlsx1(.lm_r2_slope(df),
+              file.path(allom_dir, "Allometry_PC1_vs_logCS_overall.xlsx"))
+
+    # ---------- AGE plot + per-age slopes/R² + ALWAYS write pairwise ----------
+# ---------- PC1 proxy axis ----------
+df <- data.frame(logCS = log(Csize))
+pca_tmp <- geomorph::gm.prcomp(coords_gpa)
+df$Axis1 <- as.numeric(pca_tmp$x[, 1])
+
+# normalized Age / Sex
+df$Age <- if ("Age" %in% names(meta_df)) .normalize_age(meta_df$Age) else factor(NA)
+df$Sex <- if ("Sex" %in% names(meta_df)) droplevels(factor(meta_df$Sex)) else factor(NA)
+
+# ---------- AGE plot + per-age slopes/R² + ALWAYS write pairwise ----------
+dfa <- df[!is.na(df$Age), , drop = FALSE]
+dfa$Age <- droplevels(dfa$Age)  # <- ensure factor before droplevels
+
+# write a quick diagnostic so you can *see* what survived
+age_counts <- sort(table(dfa$Age), decreasing = TRUE)
+writeLines(c(
+  "Age counts (after normalization):",
+  capture.output(print(age_counts))
+), file.path(allom_dir, "Age_counts_after_normalization.txt"))
+
+if (nrow(dfa) && nlevels(dfa$Age) >= 2) {
+  hulls <- make_hulls(dfa, "Age", x = "logCS", y = "Axis1")
+  p_age <- ggplot2::ggplot(dfa, ggplot2::aes(logCS, Axis1, color = Age)) +
+    ggplot2::geom_polygon(
+      data = hulls,
+      ggplot2::aes(logCS, Axis1, group = Age, fill = Age),
+      alpha = 0.10, inherit.aes = FALSE, linewidth = 0.35, color = NA
+    ) +
+    ggplot2::geom_point(pch = 19, size = 2.6, alpha = 0.95) +
+    ggplot2::geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 0.8) +
+    ggplot2::scale_color_manual(values = age_ramp, drop = FALSE) +
+    ggplot2::scale_fill_manual(values  = age_ramp, drop = FALSE) +
+    ggplot2::theme_light() + ggplot2::xlab("log(CS)") + ggplot2::ylab("Allometric axis (PC1 proxy)")
+  ggplot2::ggsave(file.path(allom_dir, "Allometry_logCS_byAge.jpg"),
+                  p_age, dpi = 600, width = 10, height = 5)
+
+  # per-Age slopes (require ≥2 per class)
+  tabA  <- table(dfa$Age)
+  keepA <- names(tabA)[tabA >= 2]
+  dfa2  <- droplevels(dfa[dfa$Age %in% keepA, , drop = FALSE])
+  if (nrow(dfa2)) {
+    .lm_r2_slope <- function(dat) {
+      fit <- lm(Axis1 ~ logCS, data = dat)
+      s   <- summary(fit)
+      data.frame(n = nrow(dat),
+                 intercept = unname(coef(fit)[1]),
+                 slope     = unname(coef(fit)[2]),
+                 R2        = unname(s$r.squared),
+                 p_slope   = unname(coef(s)[2, "Pr(>|t|)"]))
+    }
+    .per_group <- function(dat, grp) do.call(rbind, lapply(split(dat, grp), function(d)
+      if (nrow(d) >= 2) cbind(group = levels(grp)[attr(d, "indices")[[1]][1]], .lm_r2_slope(d))))
+    age_tbl <- .per_group(dfa2, dfa2$Age)
+    if (!is.null(age_tbl)) write_xlsx1(age_tbl, file.path(allom_dir, "Allometry_PC1_vs_logCS_byAge.xlsx"))
+  }
+
+  # pairwise (ALWAYS write; pairs with singletons become NA)
+  write_pairwise_excel(
+    dfa[, c("logCS","Axis1")],
+    droplevels(dfa$Age),
+    file.path(allom_dir, "Allometry_pairwise_byAge.xlsx"),
+    iter = 9999
+  )
+} else {
+  writeLines("No valid Age after normalization (need ≥2 levels).",
+             file.path(allom_dir, "Allometry_Age_notice.txt"))
+}
+
+
+
+
+
+  # ---------- SEX quick plot + per-sex slopes ----------
+  dfs <- df[!is.na(df$Sex) & df$Sex %in% c("M","F"), , drop = FALSE]
+  if (nrow(dfs)) {
+    dfs$Sex <- droplevels(factor(dfs$Sex))
+    p_sex <- ggplot2::ggplot(dfs, ggplot2::aes(logCS, Axis1, color = Sex)) +
+      ggplot2::geom_point(pch = 19, size = 2.8, alpha = 0.95) +
+      ggplot2::geom_smooth(method = "lm", se = FALSE, linewidth = 0.9) +
+      ggplot2::theme_light() + ggplot2::xlab("log(CS)") +
+      ggplot2::ylab("Allometric axis (PC1 proxy)") +
+      ggplot2::scale_color_manual(values = sex_cols, drop = FALSE)
+    ggplot2::ggsave(file.path(allom_dir, "Allometry_logCS_bySex.jpg"),
+                    p_sex, dpi = 600, width = 10, height = 5)
+
+    sex_tbl <- .per_group(dfs, dfs$Sex)
+    if (!is.null(sex_tbl))
+      write_xlsx1(sex_tbl,
+        file.path(allom_dir, "Allometry_PC1_vs_logCS_bySex.xlsx"))
+  }
+
+  # ---------- MULTIVARIATE (shape ~ logCS) ----------
+  gdf <- geomorph::geomorph.data.frame(coords = coords_gpa, Csize = Csize)
+  fit_allo <- geomorph::procD.lm(coords ~ log(Csize), data = gdf,
+                                 iter = 9999, print.progress = FALSE)
+  summ <- summary(fit_allo)
+
+  R2_mv <- tryCatch({
+    if (!is.null(summ$Rsq)) as.numeric(summ$Rsq) else {
+      tab <- summ$table
+      if (!is.null(tab) && "SS" %in% colnames(tab)) {
+        ss_term  <- as.numeric(tab["log(Csize)","SS"])
+        ss_total <- sum(as.numeric(tab[,"SS"]))
+        ss_term / ss_total
+      } else NA_real_
+    }
+  }, error = function(e) NA_real_)
+
+  sink(file.path(allom_dir, "Allometry_shape_vs_size_summary.txt"))
+  cat("Procrustes allometry: coords ~ log(CS)\n")
+  if (is.finite(R2_mv))
+    cat(sprintf("Multivariate R^2 (%% shape variance explained by size): %.3f\n\n", R2_mv))
+  print(summ)
+  sink()
+
+  # ---------- OPTIONAL: interactions (slope homogeneity proxies) ----------
+  if ("Species" %in% names(meta_df) &&
+      length(unique(stats::na.omit(meta_df$Species))) > 1) {
+    gdf2 <- geomorph::geomorph.data.frame(coords = coords_gpa, Csize = Csize,
+                                          Sp = droplevels(meta_df$Species))
+    fit_int_sp <- try(
+      geomorph::procD.lm(coords ~ log(Csize)*Sp, data = gdf2,
+                         iter = 9999, print.progress = FALSE),
+      silent = TRUE)
+    if (!inherits(fit_int_sp, "try-error")) {
+      sink(file.path(allom_dir, "Allometry_interaction_Species.txt"))
+      print(summary(fit_int_sp)); sink()
+    }
+  }
+  if ("Sex" %in% names(meta_df) &&
+      length(unique(stats::na.omit(meta_df$Sex))) > 1) {
+    gdf3 <- geomorph::geomorph.data.frame(coords = coords_gpa, Csize = Csize,
+                                          Sex = droplevels(meta_df$Sex))
+    fit_int_sex <- try(
+      geomorph::procD.lm(coords ~ log(Csize)*Sex, data = gdf3,
+                         iter = 9999, print.progress = FALSE),
+      silent = TRUE)
+    if (!inherits(fit_int_sex, "try-error")) {
+      sink(file.path(allom_dir, "Allometry_interaction_Sex.txt"))
+      print(summary(fit_int_sex)); sink()
+    }
+  }
+
+  # ---------- Residualized quick check (optional) ----------
+  fit_all_glob <- geomorph::procD.lm(coords ~ log(Csize), data = gdf, iter = 0)
+  p <- dim(coords_gpa)[1]; k <- dim(coords_gpa)[2]
+  coords_res <- residuals(fit_all_glob)
+  if (length(dim(coords_res)) == 2) coords_res <- geomorph::arrayspecs(coords_res, p, k)
+
+  sp_plot <- make_species_plot_factor(meta_df); sp_plot[sp_plot == "sp."] <- NA
+  keep <- !is.na(sp_plot)
+  if (sum(keep) >= 6 && nlevels(droplevels(sp_plot[keep])) >= 2) {
+    pca_r <- geomorph::gm.prcomp(coords_res[,, keep, drop = FALSE])
+    Xr    <- as.data.frame(pca_r$x)
+    gr    <- droplevels(sp_plot[keep])
+    n <- nrow(Xr); g <- nlevels(gr)
+    s2 <- (pca_r$sdev^2); cum <- cumsum(s2)/sum(s2)
+    q  <- suppressWarnings(max(2, min(which(cum >= 0.95)[1], n - g, 100), na.rm = TRUE))
+    if (!is.finite(q) || q < 2) q <- min(2, ncol(Xr))
+    loo_res <- .cv_lda_loo(as.matrix(Xr), gr, q)
+    writeLines(c(
+      "Residualized CVA (coords ~ log(CS); groups = Species; excluding 'sp.')",
+      sprintf("LOO accuracy (q=%d PCs): %.4f", q, loo_res$acc)
+    ), file.path(allom_dir, "Allometry_residual_CVA_LOO.txt"))
+    write_xlsx1(as.data.frame.matrix(loo_res$cm),
+                file.path(allom_dir, "Allometry_residual_CVA_confusion_matrix.xlsx"))
+  }
+
+  invisible(TRUE)
+}
+
+
+
+
+
+  
+# Save matrix/data.frame to .xlsx + optional short .txt summary
+.save_robust <- function(outdir, stem, df_or_mat, txt_lines = NULL){
+  df <- if (is.matrix(df_or_mat)) as.data.frame(df_or_mat) else df_or_mat
+  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+  write_xlsx1(df, file.path(outdir, paste0(stem, ".xlsx")))
+  if (!is.null(txt_lines)) {
+    writeLines(txt_lines, file.path(outdir, paste0(stem, ".txt")))
+  }
+  invisible(TRUE)
+}
+
+
+
+  # quick xlsx
+write_xlsx1 <- function(df, path) {
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+  wb <- openxlsx::createWorkbook()
+  openxlsx::addWorksheet(wb, "Sheet1")
+  openxlsx::writeData(wb, "Sheet1", df)
+  openxlsx::saveWorkbook(wb, path, overwrite = TRUE)
+}
+
+ensure_dirs <- function(...) {
+  dirs <- list(...); for (d in dirs) if (!dir.exists(d)) dir.create(d, TRUE, FALSE); invisible(NULL)
+}
+
+# convex hulls (skip excluded groups)
+make_hulls <- function(df, group_col, x = "x", y = "y", exclude_levels = NULL) {
+  # Coerce to factor BEFORE droplevels()
+  g <- factor(df[[group_col]])
+  g <- droplevels(g)
+
+  if (!is.null(exclude_levels)) {
+    df <- df[!(g %in% exclude_levels), , drop = FALSE]
+    g  <- droplevels(factor(df[[group_col]]))
+  }
+  if (!nrow(df)) return(df[0, ])
+
+  pieces <- lapply(split(df, g, drop = TRUE), function(d) {
+    if (nrow(d) < 3) return(NULL)
+    i <- chull(d[[x]], d[[y]])
+    d[i, , drop = FALSE]
+  })
+  out <- do.call(rbind, pieces)
+  if (is.null(out)) df[0, ] else out
+}
+
+
+# pairwise matrix with green cells (p<.05)
+write_pairwise_excel <- function(
+  X, group, path, iter = 9999, p_threshold = 0.05, fill_hex = "#C6E0B4"
+){
+  X <- as.data.frame(X)
+  stopifnot(nrow(X) == length(group))
+
+  # ✔ ensure factor
+  if (!is.factor(group)) group <- factor(group)
+
+  keep <- !is.na(group)
+  if (ncol(X) > 0) keep <- keep & rowSums(!is.na(X)) == ncol(X)
+  X <- X[keep, , drop = FALSE]
+  group <- droplevels(group[keep])
+
+  lev <- levels(group); k <- length(lev)
+  tab <- table(group)
+
+  M <- if (k < 2) {
+    matrix(NA_real_, 1, 1, dimnames = list(lev, lev))
+  } else {
+    m <- matrix(NA_real_, k, k, dimnames = list(lev, lev))
+    for (i in 1:(k-1)) for (j in (i+1):k) {
+      if (tab[lev[i]] < 2 || tab[lev[j]] < 2) { m[j, i] <- NA_real_; next }
+      sel <- group %in% lev[c(i, j)]
+      G2  <- droplevels(group[sel])
+      Y2  <- as.matrix(X[sel, , drop = FALSE])
+      pval <- try({
+        DF  <- geomorph::geomorph.data.frame(Y = Y2, G = G2)
+        fit <- geomorph::procD.lm(Y ~ G, data = DF, iter = iter, print.progress = FALSE)
+        suppressWarnings(summary(fit)$table["G","Pr(>F)"])
+      }, silent = TRUE)
+      m[j, i] <- if (inherits(pval, "try-error")) NA_real_ else as.numeric(pval)
+    }
+    m[upper.tri(m, diag = TRUE)] <- NA_real_
+    m
+  }
+
+  mat_df <- cbind(group = rownames(M), as.data.frame(M, check.names = FALSE))
+
+  wb <- openxlsx::createWorkbook(); sh <- "Sheet1"
+  openxlsx::addWorksheet(wb, sh); openxlsx::writeData(wb, sh, mat_df)
+  num_style <- openxlsx::createStyle(numFmt = "0.0000")
+  sig_style <- openxlsx::createStyle(fgFill = fill_hex)
+
+  is_num <- vapply(mat_df, is.numeric, logical(1))
+  data_rows <- 2:(nrow(mat_df) + 1); num_cols <- which(is_num)
+  if (length(num_cols)) {
+    openxlsx::addStyle(wb, sh, num_style, rows = data_rows, cols = num_cols,
+                       gridExpand = TRUE, stack = TRUE)
+    for (ri in seq_len(nrow(mat_df))) for (cj in num_cols) {
+      val <- mat_df[[cj]][ri]
+      if (is.finite(val) && val < p_threshold)
+        openxlsx::addStyle(wb, sh, sig_style, rows = ri + 1, cols = cj, stack = TRUE)
+    }
+  }
+  openxlsx::saveWorkbook(wb, path, overwrite = TRUE)
+}
+
+
+
+
+
+
+# ---- Levene (Brown–Forsythe) on one numeric column vs a factor ----
+.run_levene <- function(df, value_col, group_col, out_xlsx, out_txt, center = "median") {
+  ok <- requireNamespace("car", quietly = TRUE)
+  res <- NULL
+  if (ok) {
+    f <- stats::as.formula(sprintf("%s ~ %s", value_col, group_col))
+    lv <- try(car::leveneTest(f, data = df, center = center), silent = TRUE)
+    if (!inherits(lv, "try-error")) {
+      sink(out_txt); print(lv); sink()
+      res <- as.data.frame(lv)
+      res$test <- sprintf("Levene (%s)", center)
+      res$axis <- value_col
+      if (!is.null(res$`Pr(>F)`)) names(res)[names(res) == "Pr(>F)"] <- "p.value"
+      if (!is.null(res$Df))      names(res)[names(res) == "Df"]      <- "Df"
+      try(write_xlsx1(res, out_xlsx), silent = TRUE)
+    }
+  }
+  invisible(res)
+}   # <<<<<<<<<<<<<<  THIS closing brace was missing
+
+# ---- Box's M on q PCs vs a factor (multivariate homogeneity) ----
+.run_boxM <- function(Xq, groups, out_txt) {
+  if (!requireNamespace("biotools", quietly = TRUE)) {
+    writeLines("Skipped Box's M: package 'biotools' not available.", out_txt)
+    return(invisible(NULL))
+  }
+  groups <- droplevels(groups)
+  Xq <- as.matrix(Xq)
+
+  tab <- table(groups)
+  if (length(tab) < 2L) {
+    writeLines("Skipped Box's M: fewer than 2 groups.", out_txt)
+    return(invisible(NULL))
+  }
+  if (any(tab <= 1L)) {
+    writeLines("Skipped Box's M: at least one group has ≤ 1 specimen.", out_txt)
+    return(invisible(NULL))
+  }
+  if (ncol(Xq) < 1L) {
+    writeLines("Skipped Box's M: q < 1.", out_txt)
+    return(invisible(NULL))
+  }
+
+  res <- tryCatch(
+    biotools::boxM(Xq, groups),
+    error = function(e) { writeLines(paste0("Box's M failed: ", e$message), out_txt); NULL }
+  )
+  if (!is.null(res)) { sink(out_txt); cat("Box's M test for homogeneity of covariance matrices (on q PCs)\n\n"); print(res); sink() }
+  invisible(res)
+}
+
+
+
+
+
+# --- helper: turn a loading vector (length p*k) into a p×k matrix
+# pk reshape
+.as_matrix_pk <- function(loadvec, p, k) {
+  if (length(loadvec) != p * k)
+    stop("Loading length (", length(loadvec), ") != p*k (", p*k, ").")
+  geomorph::arrayspecs(matrix(as.numeric(loadvec), nrow = 1), p, k)[,,1]
+}
+
+# centroid size for one specimen
+.centroid_size <- function(M) {
+  M <- as.matrix(M); ctr <- colMeans(M, na.rm = TRUE)
+  sqrt(sum(rowSums((M - matrix(ctr, nrow(M), ncol(M), byrow = TRUE))^2)))
+}
+
+# mesh writer
+.write_mesh_obj <- function(mesh, filename) {
+  dir.create(dirname(filename), recursive = TRUE, showWarnings = FALSE)
+  if ("package:Rvcg" %in% search() || "Rvcg" %in% loadedNamespaces()) {
+    if ("vcgObjWrite" %in% getNamespaceExports("Rvcg"))
+      return(Rvcg::vcgObjWrite(mesh, filename = filename))
+  }
+  rgl::writeOBJ(filename, mesh); invisible(TRUE)
+}
+
+
+# --- SINGLE reference to use everywhere (males + females) ---
+REF_MESH_CUSTOM    <- "E:/Giraffa 3D GM/3D Scans/Skulls/Giraffa camelopardalis antiquorum/Gca_F_G_NMB_12075/Gca_F_G_NMB_12075.obj"
+REF_MESH_CUSTOM_ID <- "15"   # this must match the specimen ID in your dimnames
+
+
+choose_ref_for_warps <- function(sample_name, coords_gpa, A_complete, coords_complete_gpa) {
+  stopifnot(length(dim(coords_gpa)) == 3,
+            length(dim(A_complete)) == 3,
+            length(dim(coords_complete_gpa)) == 3)
+
+  ref_id   <- REF_MESH_CUSTOM_ID
+  ref_mesh <- REF_MESH_CUSTOM
+  if (!file.exists(ref_mesh)) stop("Reference mesh not found: ", ref_mesh)
+
+  ids_all  <- trimws(as.character(dimnames(A_complete)[[3]]))
+  ids_mean <- trimws(as.character(dimnames(coords_complete_gpa)[[3]]))
+
+  if (!(ref_id %in% ids_all))
+    stop("Chosen ref_id ('", ref_id, "') not present in A_complete.")
+  if (!(ref_id %in% ids_mean))
+    stop("Chosen ref_id ('", ref_id, "') not present in COORDS_COMPLETE_GPA.")
+
+  i_all  <- which(ids_all  == ref_id)[1]
+  i_mean <- which(ids_mean == ref_id)[1]
+
+  ref_land <- A_complete[,, i_all,  drop=FALSE][,,1]
+  ref_gpa  <- coords_complete_gpa[,, i_mean, drop=FALSE][,,1]
+  if (!all(dim(ref_land) == dim(ref_gpa)))
+    stop("ref_land and ref_gpa dims differ for ID ", ref_id)
+
+  message("Using reference ID ", ref_id, " with mesh:\n", ref_mesh)
+  list(ref_id = ref_id, ref_mesh = ref_mesh, ref_land = ref_land, ref_gpa = ref_gpa)
+}
+
+
+
+
+## ---- Minimal helpers used by both exporters --------------------------------
+
+.tweak_duplicate_pairs <- function(M,
+  pairs = list(c(46,116), c(49,62), c(52,78), c(53,113), c(71,119)),
+  eps = 1e-8, axis = 2
+){
+  M <- as.matrix(M)
+  for (pr in pairs) {
+    j <- pr[2]
+    if (j >= 1 && j <= nrow(M) && is.finite(M[j, axis]))
+      M[j, axis] <- M[j, axis] + eps
+  }
+  M
+}
+
+# pk reshape (vector -> p×k matrix)
+.as_matrix_pk <- function(loadvec, p, k) {
+  geomorph::arrayspecs(matrix(as.numeric(loadvec), nrow = 1), p, k)[,,1]
+}
+
+# Build inverse mapping from GPA space back to RAW, using a single specimen
+.procrustes_frame <- function(ref_raw, ref_gpa){
+  .unitize_land <- function(M){
+    ctr <- colMeans(M); M0 <- sweep(M, 2, ctr, "-")
+    cs  <- sqrt(sum(rowSums(M0^2)))
+    list(unit = M0/cs, ctr = ctr, cs = cs)
+  }
+  .procrustes_R <- function(A, B){
+    X <- t(A) %*% B
+    sv <- svd(X); R <- sv$u %*% t(sv$v)
+    if (det(R) < 0) { sv$u[, ncol(sv$u)] <- -sv$u[, ncol(sv$u)]; R <- sv$u %*% t(sv$v) }
+    R
+  }
+  uu <- .unitize_land(ref_raw); R <- .procrustes_R(uu$unit, ref_gpa)
+  list(inv = function(Mg){ (Mg %*% t(R)) * uu$cs + matrix(uu$ctr, nrow(Mg), ncol(Mg), byrow = TRUE) })
+}
+
+# OBJ writer (uses Rvcg if available, else rgl)
+.write_mesh_obj <- function(mesh, filename) {
+  dir.create(dirname(filename), recursive = TRUE, showWarnings = FALSE)
+  if ("Rvcg" %in% loadedNamespaces() && "vcgObjWrite" %in% getNamespaceExports("Rvcg")) {
+    Rvcg::vcgObjWrite(mesh, filename = filename)
+  } else {
+    rgl::writeOBJ(filename, mesh)
+  }
+  invisible(TRUE)
+}
+
+
+
+# =============== ALLOMETRY-ONLY for COMPLETE sex subdatasets =================
+
+run_allometry_only_complete_by_sex <- function(A_complete, meta_complete,
+                                               sex_char = c("M","F"),
+                                               base_out_dir = base_out) {
+  sex_char <- toupper(as.character(sex_char[1]))
+  stopifnot(sex_char %in% c("M","F"))
+
+  # parent “complete dataset” allometry folder
+  parent_dir <- file.path(base_out_dir, "a_complete")
+  allom_parent <- file.path(parent_dir, "Allometry")
+
+  subfolder_name <- if (sex_char == "M") "Males complete" else "Females complete"
+  outdir <- file.path(allom_parent, subfolder_name)
+  ensure_dirs(allom_parent, outdir)
+
+  # align IDs and filter by sex (keep juveniles)
+  ids_all <- dimnames(A_complete)[[3]]
+  mm <- meta_complete[match(ids_all, meta_complete$ID), , drop = FALSE]
+  keep <- !is.na(mm$Sex) & toupper(as.character(mm$Sex)) == sex_char
+  if (sum(keep) < 3L) {
+    message("Not enough specimens for ", subfolder_name, " — skipping.")
+    return(invisible(NULL))
+  }
+
+  A_sub   <- A_complete[,, keep, drop = FALSE]
+  meta_sub<- mm[keep, , drop = FALSE]
+  rownames(meta_sub) <- meta_sub$ID
+
+  # GPA
+  gp <- gpagen(A_sub, curves = sliders, ProcD = FALSE, print.progress = TRUE, PrinAxes = FALSE)
+  coords <- gp$coords
+  Csize  <- gp$Csize
+
+  # Run allometry with the standard exporter (it already plots per-Age and writes pairwise-by-Age)
+  safe_call(
+    run_allometry_11(coords, Csize, meta_sub, outdir,
+                     sample_name = paste0("a_complete_", gsub(" ", "_", subfolder_name)),
+                     sex_cols = sex_cols, age_pal = age_ramp),
+    paste0("Allometry (", subfolder_name, ")"),
+    outdir, stop_on_error = FALSE
+  )
+
+  # Make the age pairwise *extra explicit* here too (same numbers, clearer filename)
+  df_age <- data.frame(logCS = log(Csize))
+  tmp_pca <- geomorph::gm.prcomp(coords); df_age$Axis1 <- as.numeric(tmp_pca$x[,1])
+  if ("Age" %in% names(meta_sub)) df_age$Age <- meta_sub$Age
+  dfa <- df_age[!is.na(df_age$Age) & df_age$Age != "X", , drop = FALSE]
+  if (nrow(dfa) && nlevels(droplevels(dfa$Age)) >= 2) {
+    write_pairwise_excel(
+      dfa[, c("logCS","Axis1")],
+      droplevels(dfa$Age),
+      file.path(outdir, "Allometry_pairwise_byAge.xlsx"),
+      iter = 9999
+    )
+  }
+
+  invisible(list(outdir = outdir, n = dim(A_sub)[3]))
+}
+
+
+## --------------------------- export_pca_warps (reverted) ---------------------
+## ---- export_pca_warps (use real specimens at the axis ends) ----------------
+# Creates PC1/PC2 negative/positive warps as:
+#   (a) .dta files (starting_shape = ref_land)
+#   (b) warped meshes via TPS (ref_land -> target_raw)
+# Endpoints can be taken from *observed* specimens (recommended) or by
+# reconstruction (μ + t * loading). Observed ends match what LE typically shows.
+
+export_pca_warps <- function(
+  coords_gpa,                    # p×k×n GPA array (this dataset)
+  dataset_dir,                   # output base dir for this dataset
+  ref_land,                      # p×k RAW landmarks of the reference specimen
+  ref_gpa_spec,                  # p×k GPA coords of the SAME specimen (this dataset’s GPA)
+  ref_mesh_obj,                  # path to reference mesh (.obj/.ply read by rgl)
+  ends       = c("observed","reconstruct"),
+  # when ends = "observed"
+  mode_obs   = c("quantile","minmax"), q_lo = 0.05, q_hi = 0.95,
+  # when ends = "reconstruct"
+  mode_rec   = c("sd","quantile","range"), warp_mag_sd = 2,
+  dataset_label = basename(dataset_dir),
+  tweak_dups = FALSE             # keep FALSE for clean TPS around midline
+){
+  stopifnot(length(dim(coords_gpa)) == 3L, file.exists(ref_mesh_obj))
+  ends     <- match.arg(ends)
+  mode_obs <- match.arg(mode_obs)
+  mode_rec <- match.arg(mode_rec)
+
+  p <- dim(coords_gpa)[1]; k <- dim(coords_gpa)[2]
+
+  pca <- geomorph::gm.prcomp(coords_gpa)
+  S   <- pca$x                       # n×PCs scores
+  R   <- as.matrix(pca$rotation)     # (p*k)×PCs loadings
+  mu  <- apply(coords_gpa, 1:2, mean)
+
+  # GPA->RAW mapping built once from the same specimen
+  frame <- .procrustes_frame(ref_raw = ref_land, ref_gpa = ref_gpa_spec)
+
+  # reconstruction helper (for "reconstruct" mode)
+  rec_shape <- function(ax, t) {
+    vec <- .as_matrix_pk(R[, ax], p, k)
+    mu + t * vec
+  }
+
+  mesh  <- rgl::readOBJ(ref_mesh_obj)
+  out_d <- file.path(dataset_dir, "PCA"); dir.create(out_d, TRUE, FALSE)
+
+  make_axis <- function(ax){
+    if (ax > ncol(S)) return(invisible(NULL))
+    sc <- S[, ax]
+
+    # ----- choose endpoints in GPA space -----
+    if (ends == "observed") {
+      if (mode_obs == "quantile") {
+        t_lo <- as.numeric(stats::quantile(sc, q_lo, na.rm = TRUE))
+        t_hi <- as.numeric(stats::quantile(sc, q_hi, na.rm = TRUE))
+      } else { # minmax (strict extremes)
+        t_lo <- min(sc, na.rm = TRUE)
+        t_hi <- max(sc, na.rm = TRUE)
+      }
+      i_lo <- which.min(abs(sc - t_lo))
+      i_hi <- which.min(abs(sc - t_hi))
+
+      gpa_lo <- coords_gpa[,, i_lo, drop = FALSE][,,1]
+      gpa_hi <- coords_gpa[,, i_hi, drop = FALSE][,,1]
+    } else {
+      # reconstruct around the mean
+      if (mode_rec == "sd") {
+        sdax <- stats::sd(sc, na.rm = TRUE); if (!is.finite(sdax) || sdax == 0) return(invisible(NULL))
+        t_lo <- -warp_mag_sd * sdax
+        t_hi <-  warp_mag_sd * sdax
+      } else if (mode_rec == "quantile") {
+        t_lo <- as.numeric(stats::quantile(sc, q_lo, na.rm = TRUE))
+        t_hi <- as.numeric(stats::quantile(sc, q_hi, na.rm = TRUE))
+      } else { # range
+        t_lo <- min(sc, na.rm = TRUE)
+        t_hi <- max(sc, na.rm = TRUE)
+      }
+      gpa_lo <- rec_shape(ax, t_lo)
+      gpa_hi <- rec_shape(ax, t_hi)
+    }
+
+    # map GPA endpoints back to RAW of the reference specimen
+    raw_lo <- frame$inv(gpa_lo)
+    raw_hi <- frame$inv(gpa_hi)
+    if (tweak_dups) { raw_lo <- .tweak_duplicate_pairs(raw_lo); raw_hi <- .tweak_duplicate_pairs(raw_hi) }
+
+    # ---- .dta (LE/MorphoJ friendly; no [data], CRLF, proper preamble) ----
+    .write_morphologika_dta_two_LE(
+      ref_land, raw_lo,
+      file.path(out_d, sprintf("PC%d_negative_raw.dta", ax)),
+      dataset_label = dataset_label,
+      analysis_label = sprintf("PC%d negative", ax)
+    )
+    .write_morphologika_dta_two_LE(
+      ref_land, raw_hi,
+      file.path(out_d, sprintf("PC%d_positive_raw.dta", ax)),
+      dataset_label = dataset_label,
+      analysis_label = sprintf("PC%d positive", ax)
+    )
+
+    # ---- meshes (TPS: ref_land -> target_raw) ----
+    mN <- Morpho::tps3d(mesh, ref = ref_land, tarmat = raw_lo)
+    mP <- Morpho::tps3d(mesh, ref = ref_land, tarmat = raw_hi)
+    .write_mesh_obj(mN, file.path(out_d, sprintf("PC%d_negative.obj", ax)))
+    .write_mesh_obj(mP, file.path(out_d, sprintf("PC%d_positive.obj", ax)))
+
+    # optional raw XYZ
+    write.table(raw_lo, file.path(out_d, sprintf("PC%d_negative_rawXYZ.csv", ax)),
+                row.names = FALSE, col.names = FALSE, sep = ",")
+    write.table(raw_hi, file.path(out_d, sprintf("PC%d_positive_rawXYZ.csv", ax)),
+                row.names = FALSE, col.names = FALSE, sep = ",")
+  }
+
+  make_axis(1); make_axis(2)
+  invisible(TRUE)
+}
+
+
+
+
+
+
+ 
+## --------------------------- export_cva_warps (reverted) ---------------------
+export_cva_warps <- function(
+  coords_gpa, meta_df, dataset_dir,
+  ref_land, ref_gpa_spec, ref_mesh_obj,
+  group_by = c("species","subspecies","region"),
+  range_mode = c("sd","quantile","minmax"),
+  q_lo = 0.05, q_hi = 0.95, warp_mag_sd = 4,
+  dataset_label = basename(dataset_dir)
+){
+  stopifnot(length(dim(coords_gpa)) == 3L, file.exists(ref_mesh_obj))
+  range_mode <- match.arg(range_mode)
+  p <- dim(coords_gpa)[1]; k <- dim(coords_gpa)[2]
+
+  # PCA basis (scores + loadings)
+  pca <- geomorph::gm.prcomp(coords_gpa)
+  S   <- pca$x                           # n × PCs
+  L   <- as.matrix(pca$rotation)         # (p*k) × PCs
+
+  # Single GPA->RAW mapping from the same specimen used as mesh
+  frame <- .procrustes_frame(ref_raw = ref_land, ref_gpa = ref_gpa_spec)
+
+  # Back-project an LD axis (length q) to landmark space via first q PC loadings
+  backproject_ld_axis <- function(b, Lq) .as_matrix_pk(as.numeric(Lq %*% b), p, k)
+
+  # ---- normalize grouping safely (avoid clash with dplyr::group_by) ----
+  gby <- if (missing(group_by)) character(0) else group_by
+  if (is.function(gby)) gby <- character(0)
+  gby <- tolower(as.character(gby))
+  gby <- intersect(c("species","subspecies","region"),
+                   unique(gby[!is.na(gby) & nzchar(gby)]))
+
+  # one CVA export runner
+  run_one <- function(stem, Gfull){
+    Gfull <- droplevels(Gfull)
+    keep  <- !is.na(Gfull)
+    S2 <- S[keep, , drop = FALSE]; G2 <- droplevels(Gfull[keep])
+
+    tab  <- table(G2)
+    good <- names(tab)[tab >= 2]
+    if (length(good) < 2) return(invisible(NULL))
+
+    keep2 <- G2 %in% good
+    S3 <- S2[keep2, , drop = FALSE]
+    G3 <- droplevels(G2[keep2])
+
+    n <- nrow(S3); g <- nlevels(G3)
+
+    # choose q up to 95% variance but also ≤ n-g and ≤ 100
+    s2    <- (pca$sdev^2)
+    cumv  <- cumsum(s2) / sum(s2)
+    q95   <- max(2, min(which(cumv >= 0.95)[1]))
+    q     <- max(2, min(q95, n - g, ncol(S3), 100), na.rm = TRUE)
+
+    Sq <- S3[, 1:q, drop = FALSE]
+    Lq <- L[, 1:q, drop = FALSE]
+
+    lda_fit <- MASS::lda(G3 ~ ., data = data.frame(G3, Sq))
+    LD <- as.data.frame(predict(lda_fit)$x)
+    if (!ncol(LD)) return(invisible(NULL))
+
+    subdir  <- switch(stem, species="Species", subspecies="Subspecies", region="Region", tools::toTitleCase(stem))
+    out_dir <- file.path(dataset_dir, "CVA", subdir)
+    dir.create(out_dir, TRUE, FALSE)
+
+    mesh <- rgl::readOBJ(ref_mesh_obj)
+
+    n_axes <- min(2, ncol(LD))
+    for (ax in seq_len(n_axes)) {
+      z <- LD[[ax]]; if (!all(is.finite(z))) next
+      zmid <- mean(z, na.rm = TRUE)
+
+      if (range_mode == "sd") {
+        sdax <- stats::sd(z, na.rm = TRUE); if (!is.finite(sdax) || sdax == 0) next
+        dLD_neg <- -warp_mag_sd * sdax
+        dLD_pos <-  warp_mag_sd * sdax
+      } else if (range_mode == "quantile") {
+        zlo <- as.numeric(stats::quantile(z, q_lo, na.rm = TRUE))
+        zhi <- as.numeric(stats::quantile(z, q_hi, na.rm = TRUE))
+        dLD_neg <- zlo - zmid
+        dLD_pos <- zhi - zmid
+      } else { # "minmax"
+        dLD_neg <- min(z, na.rm = TRUE) - zmid
+        dLD_pos <- max(z, na.rm = TRUE) - zmid
+      }
+
+      # back-project CV axis to landmarks (GPA-space deltas)
+      b_pc <- lda_fit$scaling[1:q, ax, drop = TRUE]
+      bb   <- sum(b_pc^2); if (!is.finite(bb) || bb == 0) next
+      delta_neg <- backproject_ld_axis(dLD_neg * (b_pc / bb), Lq)
+      delta_pos <- backproject_ld_axis(dLD_pos * (b_pc / bb), Lq)
+
+      # targets in RAW (centered on the SAME reference specimen)
+      tarN_raw <- frame$inv(ref_gpa_spec + delta_neg)
+      tarP_raw <- frame$inv(ref_gpa_spec + delta_pos)
+
+      stemfile <- sprintf("CV%d_%s", ax, stem)
+
+      # Morphologika .dta (starting_shape = ref_land)
+      .write_morphologika_dta_two_LE(
+        ref_land, tarN_raw,
+        file.path(out_dir, paste0(stemfile, "_negative_raw.dta")),
+        dataset_label = dataset_label, analysis_label = sprintf("CV%d negative", ax)
+      )
+      .write_morphologika_dta_two_LE(
+        ref_land, tarP_raw,
+        file.path(out_dir, paste0(stemfile, "_positive_raw.dta")),
+        dataset_label = dataset_label, analysis_label = sprintf("CV%d positive", ax)
+      )
+
+      # TPS-warp meshes (ref_land -> target_raw)
+      mN <- Morpho::tps3d(mesh, ref = ref_land, tarmat = tarN_raw)
+      mP <- Morpho::tps3d(mesh, ref = ref_land, tarmat = tarP_raw)
+      .write_mesh_obj(mN, file.path(out_dir, paste0(stemfile, "_negative.obj")))
+      .write_mesh_obj(mP, file.path(out_dir, paste0(stemfile, "_positive.obj")))
+
+      # optional raw XYZ
+      write.table(tarN_raw, file.path(out_dir, paste0(stemfile, "_negative_rawXYZ.csv")),
+                  row.names = FALSE, col.names = FALSE, sep = ",")
+      write.table(tarP_raw, file.path(out_dir, paste0(stemfile, "_positive_rawXYZ.csv")),
+                  row.names = FALSE, col.names = FALSE, sep = ",")
+    }
+
+    invisible(TRUE)
+  } # <-- close run_one
+
+  # ---- which CVAs to run (simple + safe) ----
+  if ("species" %in% gby) {
+    sp <- make_species_plot_factor(meta_df)
+    sp[sp == "sp."] <- NA
+    run_one("species", sp)
+  }
+  if ("subspecies" %in% gby && !all(is.na(meta_df$Subspecies))) {
+    ss <- droplevels(meta_df$Subspecies)
+    ss[ss %in% c("cam. subsp.","gir. subsp.","sp. subsp.")] <- NA
+    run_one("subspecies", ss)
+  }
+  if ("region" %in% gby && !all(is.na(meta_df$Region))) {
+    rg <- as.character(meta_df$Region)
+    rg[!(rg %in% c("North","South"))] <- NA
+    run_one("region", factor(rg, levels = c("North","South")))
+  }
+
+  invisible(TRUE)
+}
+
+
+
+
+
+
+.angle_deg <- function(u, v){
+  u <- as.numeric(u); v <- as.numeric(v)
+  if (any(!is.finite(u)) || any(!is.finite(v))) return(NA_real_)
+  cu <- sqrt(sum(u*u)); cv <- sqrt(sum(v*v))
+  if (cu == 0 || cv == 0) return(NA_real_)
+  a <- sum(u*v)/(cu*cv); a <- max(-1, min(1, a))
+  acos(a)*180/pi
+}
+
+# LDA with LOO on first q PCs
+.cv_lda_loo <- function(scoresPC, groups, q){
+  dat <- data.frame(G = droplevels(groups), scoresPC[,1:q, drop=FALSE])
+  fit <- MASS::lda(G ~ ., data = dat, CV = TRUE)
+  cm  <- table(True = dat$G, Pred = fit$class)
+  list(acc = mean(fit$class == dat$G), cm = cm)
+}
+
+# Sweep q for LOO accuracy curve
+.cv_q_sweep <- function(scoresPC, groups, q_seq){
+  data.frame(
+    q = q_seq,
+    LOO_acc = vapply(q_seq, function(q) .cv_lda_loo(scoresPC, groups, q)$acc, numeric(1))
+  )
+}
+
+# Downsample-to-min class size, repeat R times
+.cv_downsample_bal <- function(scoresPC, groups, q, R = 200){
+  set.seed(1)
+  groups <- droplevels(groups)
+  tab <- table(groups); m <- min(tab)
+  if (length(tab) < 2 || m < 2) return(c(mean = NA_real_, sd = NA_real_))
+  acc <- replicate(R, {
+    keep <- unlist(lapply(levels(groups), function(g){
+      idx <- which(groups == g); sample(idx, m, replace = FALSE)
+    }))
+    .cv_lda_loo(scoresPC[keep, , drop=FALSE], groups[keep], q)$acc
+  })
+  c(mean = mean(acc), sd = stats::sd(acc))
+}
+
+# Axis stability via bootstrap (within-class resample), return angles
+.cv_boot_axis_angles <- function(scoresPC, groups, q, B = 200){
+  dat <- data.frame(G = droplevels(groups), scoresPC[,1:q, drop=FALSE])
+  fit0 <- MASS::lda(G ~ ., data = dat)
+  B0   <- fit0$scaling[, 1:min(2, ncol(fit0$scaling)), drop=FALSE]
+  if (is.null(B0) || !ncol(B0)) return(NULL)
+  lev <- levels(dat$G)
+  bylev <- lapply(lev, function(g) which(dat$G == g))
+  angs <- matrix(NA_real_, nrow = B, ncol = ncol(B0))
+  set.seed(2)
+  for (b in seq_len(B)){
+    idx <- unlist(lapply(bylev, function(ii) sample(ii, length(ii), replace = TRUE)))
+    datab <- dat[idx, , drop=FALSE]
+    fb <- try(MASS::lda(G ~ ., data = datab), silent = TRUE)
+    if (inherits(fb, "try-error") || is.null(fb$scaling)) next
+    Bb <- fb$scaling[, 1:ncol(B0), drop=FALSE]
+    # sign-align each axis to baseline
+    for (j in seq_len(ncol(B0))){
+      v0 <- B0[, j]; vb <- Bb[, j]
+      if (!all(is.finite(v0)) || !all(is.finite(vb))) next
+      if (sum(v0*vb) < 0) vb <- -vb
+      angs[b, j] <- .angle_deg(v0, vb)
+    }
+  }
+  colnames(angs) <- paste0("CV", seq_len(ncol(B0)))
+  angs
+}
+
+# Random label-noise stress test (flip fraction p of labels), repeat R times
+.cv_label_noise <- function(scoresPC, groups, q, p = 0.05, R = 200){
+  set.seed(3)
+  groups <- droplevels(groups)
+  lev <- levels(groups)
+  if (nlevels(groups) < 2) return(c(mean = NA_real_, sd = NA_real_))
+
+  n <- length(groups)
+  k <- max(1, round(p * n))
+
+  acc <- replicate(R, {
+    g2 <- groups
+    flip <- sample.int(n, k)
+
+    # reassign each flipped index to a random *different* label
+    new_labels <- vapply(flip, function(i) {
+      choices <- lev[lev != as.character(groups[i])]
+      sample(choices, 1)
+    }, character(1))
+
+    g2[flip] <- factor(new_labels, levels = lev)
+
+    .cv_lda_loo(scoresPC, g2, q)$acc
+  })
+
+  c(mean = mean(acc), sd = stats::sd(acc))
+}
+
+
+
+
+# ===================== (9) PCA + CVA block =====================
+
+.run_cva_or_bg_local <- function(coords, group_factor, cva_dir, stem,
+                                 palette = NULL, exclude_levels = NULL) {
+  stem        <- as.character(stem)[1]
+  subdir_name <- .stem_subdir(stem)
+  cva_subdir  <- file.path(cva_dir, subdir_name)
+  dir.create(cva_subdir, showWarnings = FALSE, recursive = TRUE)
+
+  g <- droplevels(group_factor)
+
+  if (!is.null(exclude_levels)) {
+    keep <- !(g %in% exclude_levels)
+    coords <- coords[, , keep, drop = FALSE]
+    g <- droplevels(g[keep])
+  }
+  if (nlevels(g) < 2 || sum(!is.na(g)) < 3) return(invisible(NULL))
+
+  pca <- geomorph::gm.prcomp(coords)
+  X   <- as.data.frame(pca$x)
+  n   <- nrow(X); k <- nlevels(g)
+  cumvar <- cumsum((pca$sdev^2) / sum(pca$sdev^2))
+  nPC <- suppressWarnings(max(2, min(which(cumvar >= 0.95)[1], n - k, 100), na.rm = TRUE))
+  if (!is.finite(nPC) || nPC < 2) nPC <- min(2, ncol(X))
+
+  tab <- table(g)
+  keep_groups <- names(tab)[tab >= 2]
+  if (length(keep_groups) < 2) {
+    means <- sapply(levels(g), function(gl)
+      colMeans(geomorph::two.d.array(coords)[g == gl, , drop = FALSE]))
+    means <- t(means)
+    p <- prcomp(means, scale. = FALSE)
+    sc <- as.data.frame(p$x[, 1:2, drop = FALSE]); sc$group <- rownames(sc)
+
+    plt <- ggplot2::ggplot(sc, ggplot2::aes(PC1, PC2, color = group)) +
+      ggplot2::geom_point(pch = 19, size = 4) + ggplot2::theme_light() +
+      ggplot2::ggtitle(paste0("Between-group PCA (fallback) — ", subdir_name))
+    if (!is.null(palette)) plt <- plt + ggplot2::scale_color_manual(values = palette, drop = FALSE)
+    ggplot2::ggsave(file.path(cva_subdir, "CVA_bgPCA.jpg"), plt, dpi = 600, width = 10, height = 5)
+    return(invisible(NULL))
+  }
+
+  keep_idx <- g %in% keep_groups
+  g2  <- droplevels(g[keep_idx])
+  X2  <- X[keep_idx, 1:nPC, drop = FALSE]
+
+  # Cap q by smallest group size - 1, then trim X2 accordingly (your code below)
+min_grp <- min(table(g2))
+nPC <- min(nPC, ncol(X2), min_grp - 1)
+if (!is.finite(nPC) || nPC < 2) nPC <- min(2, ncol(X2))
+X2 <- X2[, 1:nPC, drop = FALSE]
+
+
+lda <- MASS::lda(g2 ~ ., data = data.frame(g2, X2))
+  ld  <- as.data.frame(predict(lda)$x); ld$group <- g2
+
+    # normalize LD columns if they exist
+if ("LD1" %in% names(ld)) ld$LD1 <- suppressWarnings(as.numeric(ld$LD1))
+if ("LD2" %in% names(ld)) ld$LD2 <- suppressWarnings(as.numeric(ld$LD2))
+
+# SAFE subsetting: build the keep vector in two steps
+keep_rows <- if ("LD1" %in% names(ld)) is.finite(ld$LD1) else rep(FALSE, nrow(ld))
+if ("LD2" %in% names(ld)) keep_rows <- keep_rows | is.finite(ld$LD2)
+ld <- ld[keep_rows, , drop = FALSE]
+if (!nrow(ld)) return(invisible(NULL))
+
+
+ 
+
+
+# ---- Levene on LD1/LD2 (if present) ----
+lev_dir <- cva_subdir
+if ("LD1" %in% names(ld)) {
+  .run_levene(ld, "LD1", "group",
+              file.path(lev_dir, "Levene_LD1.xlsx"),
+              file.path(lev_dir, "Levene_LD1.txt"),
+              center = "median")
+}
+if ("LD2" %in% names(ld)) {
+  .run_levene(ld, "LD2", "group",
+              file.path(lev_dir, "Levene_LD2.xlsx"),
+              file.path(lev_dir, "Levene_LD2.txt"),
+              center = "median")
+}
+
+    if (nPC >= 2 && min_grp > nPC) {
+    .run_boxM(as.matrix(X2), g2, file.path(lev_dir, "BoxM_qPCs.txt"))
+  } else {
+    writeLines(
+      sprintf("Skipped Box's M: q=%d, min(group size)=%d", nPC, min_grp),
+      file.path(lev_dir, "BoxM_qPCs.txt")
+    )
+  }
+# % variance labels
+      ev <- lda$svd^2
+  cvpct <- if (length(ev)) round(100 * ev / sum(ev), 2) else c(NA_real_, NA_real_)
+  have_LD2 <- "LD2" %in% names(ld) && any(is.finite(ld$LD2))
+
+  if (have_LD2) {
+    # drop rows with non-finite LD2
+    ldp <- ld[is.finite(ld$LD2), , drop = FALSE]
+    if (!nrow(ldp)) return(invisible(NULL))
+    xlab <- sprintf("CV1%s", ifelse(is.finite(cvpct[1]), paste0(" (", cvpct[1], "%)"), ""))
+    ylab <- sprintf("CV2%s", ifelse(is.finite(cvpct[2]), paste0(" (", cvpct[2], "%)"), ""))
+
+    plt <- ggplot2::ggplot(ldp, ggplot2::aes(x = LD1, y = LD2, color = group)) +
+      ggplot2::geom_point(pch = 19, size = 2.8, alpha = 0.95) +
+      ggplot2::theme_light() + ggplot2::xlab(xlab) + ggplot2::ylab(ylab)
+
+    if (!is.null(palette)) {
+      plt <- plt + ggplot2::scale_color_manual(values = palette, drop = FALSE)
+    }
+
+    # build hulls only from finite rows; skip when <3 per group
+    hull_in <- ldp[is.finite(ldp$LD1) & is.finite(ldp$LD2), , drop = FALSE]
+    if (nrow(hull_in)) {
+      hulls <- make_hulls(hull_in, "group", x = "LD1", y = "LD2",
+                          exclude_levels = HULL_EXCLUDE)
+      if (nrow(hulls)) {
+        plt <- plt + ggplot2::geom_polygon(
+          data = hulls,
+          ggplot2::aes(x = LD1, y = LD2, group = group, fill = group),
+          alpha = 0.12, inherit.aes = FALSE, linewidth = 0.4, color = NA
+        )
+        if (!is.null(palette)) {
+          plt <- plt + ggplot2::scale_fill_manual(values = palette, drop = FALSE)
+        }
+      }
+    }
+  } else {
+    # Only LD1 available → plot vs zero baseline (no hulls)
+    ld$Zero <- 0
+    xlab <- sprintf("CV1%s", ifelse(is.finite(cvpct[1]), paste0(" (", cvpct[1], "%)"), ""))
+    plt <- ggplot2::ggplot(ld, ggplot2::aes(x = LD1, y = Zero, color = group)) +
+      ggplot2::geom_point(pch = 19, size = 2.8, alpha = 0.95) +
+      ggplot2::theme_light() + ggplot2::xlab(xlab) + ggplot2::ylab("") +
+      ggplot2::theme(axis.text.y = ggplot2::element_blank(),
+                     axis.ticks.y = ggplot2::element_blank())
+
+    if (!is.null(palette)) {
+      plt <- plt + ggplot2::scale_color_manual(values = palette, drop = FALSE)
+    }
+  }
+
+  out_plot   <- file.path(cva_subdir, paste0("CVA_", subdir_name, ".jpg"))
+  out_scores <- file.path(cva_subdir, paste0("CVA_", subdir_name, "_scores.xlsx"))
+  ggplot2::ggsave(out_plot, plt, dpi = 600, width = 10, height = 5)
+  write_xlsx1(ld, out_scores)
+
+
+
+  coords2 <- coords[, , keep_idx, drop = FALSE]
+  gdf <- geomorph::geomorph.data.frame(coords = coords2, group = g2)
+  fit <- geomorph::procD.lm(coords ~ group, data = gdf, iter = 9999, print.progress = FALSE)
+  sink(file.path(cva_subdir, paste0("CVA_", subdir_name, "_ProcrustesANOVA.txt"))); print(summary(fit)); sink()
+
+  write_pairwise_excel(
+    ld[, intersect(colnames(ld), c("LD1","LD2")), drop = FALSE],
+    ld$group,
+    file.path(cva_subdir, paste0("CVA_", subdir_name, "_pairwise_matrix.xlsx")),
+    iter = 9999
+  )
+
+  # ====== ROBUSTNESS ADD-ONS (exports alongside this CVA) ===============
+
+  # 9.1 LOO accuracy + confusion matrix (q = nPC)
+  loo <- .cv_lda_loo(as.matrix(X2), g2, nPC)
+  .save_robust(cva_subdir, "CVA_LOO_confusion_matrix", as.data.frame.matrix(loo$cm),
+               sprintf("LOO accuracy (q=%d PCs): %.4f", nPC, loo$acc))
+
+  # 9.2 q-sweep (2..min(25, n-k)) for LOO accuracy curve
+  qmax <- max(2, min(25, nrow(X2) - nlevels(g2), ncol(X2)))
+  qseq <- seq(2, qmax)
+  sweep_df <- .cv_q_sweep(as.matrix(X2), g2, qseq)
+  .save_robust(cva_subdir, "CVA_LOO_accuracy_vs_q", sweep_df,
+               paste0("q sweep from 2 to ", qmax, " (inclusive)."))
+
+  # 9.3 Balanced accuracy via repeated downsampling to smallest class
+  ds <- .cv_downsample_bal(as.matrix(X2), g2, nPC, R = 200)
+  writeLines(sprintf("Downsampled (to min class; R=200) LOO accuracy (q=%d): mean=%.4f sd=%.4f",
+                     nPC, ds["mean"], ds["sd"]),
+             file.path(cva_subdir, "CVA_downsampled_accuracy.txt"))
+
+  # 9.4 Axis stability: bootstrap angles between baseline CV1/CV2
+  angs <- .cv_boot_axis_angles(as.matrix(X2), g2, nPC, B = 200)
+  if (!is.null(angs)) {
+    .save_robust(cva_subdir, "CVA_axis_boot_angles", angs,
+      paste0("Angles (deg) between baseline and bootstrap CV axes; rows=bootstrap draws.\n",
+             "Report median[IQR]: ",
+             paste(colnames(angs), apply(angs, 2, function(x){
+               x <- x[is.finite(x)]
+               if (!length(x)) return("NA")
+               sprintf("%.2f [%.2f–%.2f]", stats::median(x), stats::quantile(x, .25), stats::quantile(x, .75))
+             }), collapse = "; ")))
+  }
+
+  # 9.5 Label-noise stress-test (flip ~5% labels)
+  ln <- .cv_label_noise(as.matrix(X2), g2, nPC, p = 0.05, R = 200)
+  writeLines(sprintf("Label-noise (p=0.05; R=200) LOO accuracy (q=%d): mean=%.4f sd=%.4f",
+                     nPC, ln["mean"], ln["sd"]),
+             file.path(cva_subdir, "CVA_label_noise_accuracy.txt"))
+
+invisible(list(plot = out_plot, scores = out_scores, dir = cva_subdir))
+}
+
+
+  
+
+
+
+run_pca_and_phylos_11 <- function(coords, meta_df, pca_dir, cva_dir, sample_name,
+                                  pal_species, pal_subspecies, pal_region, pal_age,
+                                  Tree_Species = NULL, Tree_Subspecies = NULL,
+                                  add_age_pca_for_complete = FALSE,
+                                  only = NULL) {
+    do_species    <- is.null(only) || "species"    %in% only
+  do_subspecies <- is.null(only) || "subspecies" %in% only
+  do_region     <- is.null(only) || "region"     %in% only
+  do_age        <- is.null(only) || "age"        %in% only
+dir.create(pca_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # PCA
+  pca <- geomorph::gm.prcomp(coords)
+  varpc <- round(100 * (pca$sdev^2) / sum(pca$sdev^2), 2)
+  scores <- cbind(as.data.frame(pca$x), meta_df)
+  write_xlsx1(scores, file.path(pca_dir, "PCA_scores.xlsx"))
+
+  # Species PCA
+  SpeciesPlot <- make_species_plot_factor(meta_df)
+  if (nlevels(droplevels(SpeciesPlot)) > 1) {
+    df <- cbind(scores[, c("Comp1","Comp2")], SpeciesPlot = SpeciesPlot)
+    hulls <- make_hulls(df, "SpeciesPlot", x = "Comp1", y = "Comp2",
+                        exclude_levels = HULL_EXCLUDE)
+    p_sp <- ggplot2::ggplot(df, ggplot2::aes(Comp1, Comp2, color = SpeciesPlot)) +
+      ggplot2::geom_polygon(
+        data = hulls,
+        ggplot2::aes(Comp1, Comp2, group = SpeciesPlot, fill = SpeciesPlot),
+        alpha = 0.12, inherit.aes = FALSE, linewidth = 0.4, color = NA
+      ) +
+      ggplot2::geom_point(pch = 19, size = 2.8, alpha = 0.95) + ggplot2::theme_light() +
+      ggplot2::xlab(paste0("PC1 (", varpc[1], "%)")) +
+      ggplot2::ylab(paste0("PC2 (", varpc[2], "%)")) +
+      ggplot2::scale_color_manual(values = pal_species, drop = FALSE) +
+      ggplot2::scale_fill_manual(values  = pal_species, drop = FALSE)
+    ggplot2::ggsave(file.path(pca_dir, "PCA_species.jpg"), p_sp, dpi = 600, width = 10, height = 5)
+
+    df_sp <- df[!is.na(df$SpeciesPlot) & df$SpeciesPlot != "sp.", , drop = FALSE]
+    # df has columns Comp1, Comp2, and SpeciesPlot
+.run_levene(df[!is.na(df$SpeciesPlot), ], "Comp1", "SpeciesPlot",
+            file.path(pca_dir, "Levene_PC1_bySpecies.xlsx"),
+            file.path(pca_dir, "Levene_PC1_bySpecies.txt"),
+            center = "median")
+write_pairwise_excel(df_sp[, c("Comp1","Comp2")], droplevels(df_sp$SpeciesPlot),
+                         file.path(pca_dir, "PCA_species_pairwise_matrix.xlsx"), iter = 9999)
+  }
+
+  # Subspecies PCA
+  if (!all(is.na(scores$Subspecies)) && nlevels(droplevels(scores$Subspecies)) > 1) {
+    df <- scores[!is.na(scores$Subspecies), , drop = FALSE]
+    hulls <- make_hulls(df, "Subspecies", x = "Comp1", y = "Comp2",
+                        exclude_levels = HULL_EXCLUDE)
+    p_ssp <- ggplot2::ggplot(df, ggplot2::aes(Comp1, Comp2, color = Subspecies)) +
+      ggplot2::geom_polygon(
+        data = hulls,
+        ggplot2::aes(Comp1, Comp2, group = Subspecies, fill = Subspecies),
+        alpha = 0.12, inherit.aes = FALSE, linewidth = 0.4, color = NA
+      ) +
+      ggplot2::geom_point(pch = 19, size = 2.8, alpha = 0.95) + ggplot2::theme_light() +
+      ggplot2::xlab(paste0("PC1 (", varpc[1], "%)")) +
+      ggplot2::ylab(paste0("PC2 (", varpc[2], "%)")) +
+      ggplot2::scale_color_manual(values = pal_subspecies, drop = FALSE) +
+      ggplot2::scale_fill_manual(values  = pal_subspecies, drop = FALSE)
+    ggplot2::ggsave(file.path(pca_dir, "PCA_subspecies.jpg"), p_ssp, dpi = 600, width = 10, height = 5)
+
+    
+.run_levene(df, "Comp1", "Subspecies",
+            file.path(pca_dir, "Levene_PC1_bySubspecies.xlsx"),
+            file.path(pca_dir, "Levene_PC1_bySubspecies.txt"), center = "median")
+write_pairwise_excel(df[, c("Comp1","Comp2")], df$Subspecies,
+                         file.path(pca_dir, "PCA_subspecies_pairwise_matrix.xlsx"), iter = 9999)
+  }
+
+  # Region PCA (North/South only)
+  if (!all(is.na(scores$Region))) {
+    df <- scores[scores$Region %in% c("North","South"), , drop = FALSE]
+    if (nrow(df) >= 3 && nlevels(droplevels(df$Region)) > 1) {
+      hulls <- make_hulls(df, "Region", x = "Comp1", y = "Comp2",
+                          exclude_levels = HULL_EXCLUDE)
+      p_reg <- ggplot2::ggplot(df, ggplot2::aes(Comp1, Comp2, color = Region)) +
+        ggplot2::geom_polygon(
+          data = hulls,
+          ggplot2::aes(Comp1, Comp2, group = Region, fill = Region),
+          alpha = 0.12, inherit.aes = FALSE, linewidth = 0.4, color = NA
+        ) +
+        ggplot2::geom_point(pch = 19, size = 2.8, alpha = 0.95) + ggplot2::theme_light() +
+        ggplot2::xlab(paste0("PC1 (", varpc[1], "%)")) +
+        ggplot2::ylab(paste0("PC2 (", varpc[2], "%)")) +
+        ggplot2::scale_color_manual(values = pal_region, drop = FALSE) +
+        ggplot2::scale_fill_manual(values  = pal_region, drop = FALSE)
+      ggplot2::ggsave(file.path(pca_dir, "PCA_region.jpg"), p_reg, dpi = 600, width = 10, height = 5)
+
+  .run_levene(df, "Comp1", "Region",
+            file.path(pca_dir, "Levene_PC1_byRegion.xlsx"),
+            file.path(pca_dir, "Levene_PC1_byRegion.txt"), center = "median")  
+write_pairwise_excel(df[, c("Comp1","Comp2")], droplevels(df$Region),
+                           file.path(pca_dir, "PCA_region_pairwise_matrix.xlsx"), iter = 9999)
+    }
+  }
+
+  # Age PCA (only for complete dataset; drop Age "X" in pairwise)
+  if (add_age_pca_for_complete && "Age" %in% names(scores) && !all(is.na(scores$Age))) {
+    df <- scores[!is.na(scores$Age) & scores$Age != "X", , drop = FALSE]
+    if (nrow(df)) {
+      hulls <- make_hulls(df, "Age", x = "Comp1", y = "Comp2",
+                          exclude_levels = HULL_EXCLUDE)
+      p_age <- ggplot2::ggplot(df, ggplot2::aes(Comp1, Comp2, color = Age)) +
+        ggplot2::geom_polygon(
+          data = hulls,
+          ggplot2::aes(Comp1, Comp2, group = Age, fill = Age),
+          alpha = 0.10, inherit.aes = FALSE, linewidth = 0.35, color = NA
+        ) +
+        ggplot2::geom_point(pch = 19, size = 2.6, alpha = 0.95) + ggplot2::theme_light() +
+        ggplot2::xlab(paste0("PC1 (", varpc[1], "%)")) +
+        ggplot2::ylab(paste0("PC2 (", varpc[2], "%)")) +
+        ggplot2::scale_color_manual(values = pal_age, drop = FALSE) +
+        ggplot2::scale_fill_manual(values  = pal_age, drop = FALSE)
+      ggplot2::ggsave(file.path(pca_dir, "PCA_age.jpg"), p_age, dpi = 600, width = 10, height = 5)
+
+    .run_levene(df, "Comp1", "Age",
+            file.path(pca_dir, "Levene_PC1_byAge.xlsx"),
+            file.path(pca_dir, "Levene_PC1_byAge.txt"), center = "median")
+
+ write_pairwise_excel(df[, c("Comp1","Comp2")], droplevels(df$Age),
+                           file.path(pca_dir, "PCA_age_pairwise_matrix.xlsx"), iter = 9999)
+    }
+  }
+
+  # CVAs
+  if (nlevels(droplevels(SpeciesPlot)) > 1) {
+    .run_cva_or_bg_local(coords, SpeciesPlot, cva_dir, "species",
+                         palette = pal_species, exclude_levels = "sp.")
+  }
+  if (!all(is.na(meta_df$Subspecies)) && nlevels(droplevels(meta_df$Subspecies)) > 1) {
+    .run_cva_or_bg_local(coords, meta_df$Subspecies, cva_dir, "subspecies",
+                         palette = pal_subspecies,
+                         exclude_levels = c("cam. subsp.","gir. subsp.","sp. subsp."))
+  }
+  if (!all(is.na(meta_df$Region))) {
+    idx <- which(meta_df$Region %in% c("North","South"))
+    if (length(idx) >= 3 && nlevels(droplevels(meta_df$Region[idx])) > 1) {
+      .run_cva_or_bg_local(coords[, , idx, drop = FALSE],
+                           droplevels(meta_df$Region[idx]),
+                           cva_dir, "region",
+                           palette = pal_region)
+    }
+  }
+
+  invisible(TRUE)
+}
+
+
+# ================= Adults-only allometry subsets from a_complete =================
+
+# Helpers -------------------------------------------------------------
+
+.is_adult_age <- function(Age) {
+  # True adults E–I; allow X (unknown) to stay in the dataset but it will be ignored in pairwise
+  a <- toupper(trimws(as.character(Age)))
+  a %in% c("E","F","G","H","I","X")
+}
+
+.clean_row_names_df <- function(df) {
+  # tibble-safe
+  df <- as.data.frame(df)
+  if ("ID" %in% names(df)) rownames(df) <- df$ID
+  df
+}
+
+.compute_multivar_R2 <- function(coords_gpa, Csize) {
+  gdf <- geomorph::geomorph.data.frame(coords = coords_gpa, Csize = Csize)
+  fit <- geomorph::procD.lm(coords ~ log(Csize), data = gdf,
+                             iter = 9999, print.progress = FALSE)
+  sm  <- summary(fit)
+
+  # Try summary$Rsq; else compute from SS
+  if (!is.null(sm$Rsq)) {
+    as.numeric(sm$Rsq)
+  } else {
+    tab <- sm$table
+    if (!is.null(tab) && "SS" %in% colnames(tab)) {
+      ss_term  <- as.numeric(tab["log(Csize)","SS"])
+      ss_total <- sum(as.numeric(tab[,"SS"]))
+      ss_term / ss_total
+    } else NA_real_
+  }
+}
+
+# Core runner for one adults-only subset ----------------------------------------
+# sex_filter: "M", "F", or "both" (keeps only Sex in c("M","F") in all cases)
+run_allometry_adults_subset <- function(A_complete, meta_complete,
+                                        sex_filter = c("M","F","both")) {
+  sex_filter <- match.arg(sex_filter)
+
+  # Align metadata to array order
+  ids <- dimnames(A_complete)[[3]]
+  stopifnot(all(ids %in% meta_complete$ID))
+  meta2 <- meta_complete[match(ids, meta_complete$ID), , drop = FALSE]
+  meta2 <- .clean_row_names_df(meta2)
+
+  # Adults mask (E–I or X) + Sex M/F
+  keep_adult <- .is_adult_age(meta2$Age) & meta2$Sex %in% c("M","F")
+  if (sex_filter == "M") keep_adult <- keep_adult & (meta2$Sex == "M")
+  if (sex_filter == "F") keep_adult <- keep_adult & (meta2$Sex == "F")
+
+  if (sum(keep_adult) < 3L) {
+    message("Adults subset '", sex_filter, "' has < 3 specimens; skipping.")
+    return(invisible(NULL))
+  }
+
+  A_sub    <- A_complete[,, keep_adult, drop = FALSE]
+  meta_sub <- meta2[ keep_adult, , drop = FALSE]
+  meta_sub <- .clean_row_names_df(meta_sub)
+
+  # GPA
+  gp <- gpagen(A_sub, curves = sliders, ProcD = FALSE, print.progress = TRUE, PrinAxes = FALSE)
+  coords <- gp$coords
+  Csize  <- gp$Csize
+
+  # Output folder names
+  parent_dir <- file.path(base_out, "a_complete", "Allometry")
+  sub_name   <- switch(sex_filter,
+                       "M"    = "Males adults",
+                       "F"    = "Females adults",
+                       "both" = "Adults (M+F)")
+  outdir <- file.path(parent_dir, sub_name)
+  ensure_dirs(parent_dir, outdir)
+
+  ## --- inside run_allometry_adults_all() *after* you GPA the Adults (M+F)
+## coords_ad, Csize_ad, meta_ad are the adults-only arrays/data
+
+# 1) Run the standard allometry (it makes plots + overall stats)
+safe_call(
+  run_allometry_11(coords_ad, Csize_ad, meta_ad, outdir_ad,
+                   sample_name = "a_complete_Adults_MplusF",
+                   sex_cols = sex_cols, age_pal = age_ramp),
+  "Allometry adults subset: Adults (M+F)", outdir_ad, stop_on_error = FALSE
+)
+
+# 2) Force the AGE pairwise Excel specifically for this subset
+df_age <- data.frame(logCS = log(Csize_ad))
+tmp_pc <- geomorph::gm.prcomp(coords_ad)
+df_age$Axis1 <- as.numeric(tmp_pc$x[,1])
+
+# Keep Age column from metadata; allow E–I and X (X in plots but excluded from pairwise)
+if ("Age" %in% names(meta_ad)) df_age$Age <- meta_ad$Age
+
+# Drop NA and keep only E–I and X
+df_age$Age <- as.character(df_age$Age)
+df_age$Age[!df_age$Age %in% c("E","F","G","H","I","X")] <- NA
+dfa <- df_age[!is.na(df_age$Age), , drop = FALSE]
+
+# If there’s any data at all, write the pairwise-by-Age matrix (excluding X from the test)
+if (nrow(dfa)) {
+  write_pairwise_excel(
+    dfa[dfa$Age != "X", c("logCS","Axis1"), drop = FALSE],
+    droplevels(factor(dfa$Age[dfa$Age != "X"], levels = c("E","F","G","H","I"))),
+    file.path(outdir_ad, "Allometry_pairwise_byAge.xlsx"),
+    iter = 9999
+  )
+}
+
+
+# 2) Make the "Age availability" explicit (helpful sanity check)
+  Age_vec <- toupper(trimws(as.character(meta_sub$Age)))
+  age_counts <- sort(table(Age_vec), decreasing = TRUE)
+  write_txt1(c(
+    "Adults-only subset age counts (kept E–I and X):",
+    capture.output(print(age_counts)),
+    "",
+    "Note: pairwise matrix excludes Age == 'X' automatically."
+  ), file.path(outdir, "Allometry_Age_counts.txt"))
+
+  # 3) Multivariate R^2 (shape ~ log(CS)) as a tiny, obvious file
+  R2_mv <- .compute_multivar_R2(coords, Csize)
+  write_txt1(sprintf("Multivariate R^2 (shape ~ log(CS)) = %.4f", R2_mv),
+             file.path(outdir, "Allometry_multivariate_R2.txt"))
+  write_xlsx1(data.frame(Multivariate_R2 = R2_mv),
+              file.path(outdir, "Allometry_multivariate_R2.xlsx"))
+
+  invisible(list(outdir = outdir, n = dim(A_sub)[3], R2 = R2_mv))
+}
+
+# Convenience wrapper: run all three adults-only datasets in one go -------------
+run_allometry_adults_all <- function(A_complete, meta_complete) {
+  res_M   <- run_allometry_adults_subset(A_complete, meta_complete, "M")
+  res_F   <- run_allometry_adults_subset(A_complete, meta_complete, "F")
+  res_MF  <- run_allometry_adults_subset(A_complete, meta_complete, "both")
+  invisible(list(males = res_M, females = res_F, adults_both = res_MF))
+}
+
+
+
+############################################################
+## (10) Run ONE sample end-to-end (+ PCA/CVA WARPS)
+############################################################
+
+safe_call <- function(expr, label = "step", outdir = NULL, stop_on_error = TRUE) {
+  tryCatch(
+    force(expr),
+    error = function(e) {
+      msg <- paste0("[", label, "] FAILED: ", conditionMessage(e))
+      if (!is.null(outdir)) {
+        dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+        writeLines(msg, file.path(outdir, "errors.log"), useBytes = TRUE)
+      }
+      if (stop_on_error) stop(msg) else message(msg)
+      invisible(NULL)
+    }
+  )
+}
+
+run_sample <- function(A, meta, sample_name) {
+  # parent directory stays the dataset key
+  parent_dir <- file.path(base_out, sample_name)
+
+  # Put adult sets into a "Complete" subfolder
+  complete_sub <- .complete_subfolder_name(sample_name)
+  outdir <- if (is.null(complete_sub)) parent_dir else file.path(parent_dir, complete_sub)
+
+  pca_dir   <- file.path(outdir, "PCA")
+  cva_dir   <- file.path(outdir, "CVA")
+  allom_dir <- file.path(outdir, "Allometry")
+  ensure_dirs(parent_dir, outdir, pca_dir, cva_dir, allom_dir)
+
+  cat("\n=== Sample:", sample_name, "→", normalizePath(outdir, mustWork = FALSE), "===\n")
+  pca_dir   <- file.path(outdir, "PCA")
+  cva_dir   <- file.path(outdir, "CVA")
+  allom_dir <- file.path(outdir, "Allometry")
+  ensure_dirs(outdir, pca_dir, cva_dir, allom_dir)
+
+  cat("\n=== Sample:", sample_name, "===\n")
+
+  if (is.null(dim(A)) || length(dim(A)) != 3)
+    stop("Array `A` must be a 3D landmark array for sample ", sample_name)
+  needed_cols <- c("ID","Species","Subspecies","Sex","Age","Region")
+  miss_cols <- setdiff(needed_cols, names(meta))
+  if (length(miss_cols)) stop("Metadata missing columns: ", paste(miss_cols, collapse=", "))
+
+  gp <- gpagen(A, curves = sliders, ProcD = FALSE, print.progress = TRUE, PrinAxes = FALSE)
+  coords <- gp$coords
+  Csize  <- gp$Csize
+  ids_gp <- dimnames(coords)[[3]]
+
+  if (!all(ids_gp %in% meta$ID)) {
+    stop("Some GPA specimen IDs are missing from metadata for sample ", sample_name,
+         "\nMissing: ", paste(ids_gp[!ids_gp %in% meta$ID], collapse = ", "))
+  }
+  meta2 <- meta[match(ids_gp, meta$ID), , drop = FALSE]
+  if (any(meta2$ID != ids_gp)) stop("Metadata did not align 1:1 to GPA IDs for ", sample_name)
+  meta_df <- as.data.frame(meta2); rownames(meta_df) <- meta_df$ID
+
+  # PCA/CVAs plots + stats
+  safe_call(
+    run_pca_and_phylos_11(
+      coords, meta_df, pca_dir, cva_dir, sample_name,
+      pal_species    = species_cols_master,
+      pal_subspecies = subspecies_cols_master,
+      pal_region     = region_cols,
+      pal_age        = age_ramp,
+      Tree_Species   = Tree_Species,
+      Tree_Subspecies= Tree_Subspecies,
+      add_age_pca_for_complete = (sample_name == "a_complete")
+    ),
+    "PCA/CVAs block", outdir, stop_on_error = TRUE
+  )
+
+  # Choose reference (allows falling back to COORDS_COMPLETE_GPA if needed)
+ ref <- choose_ref_for_warps(
+  sample_name,
+  coords_gpa = coords,
+  A_complete = A_complete,
+  coords_complete_gpa = COORDS_COMPLETE_GPA
+)
+
+
+
+    # --- Warps ---
+if (identical(sample_name, "d_adult_females")) {
+  # use observed ends (5–95%) with no extra amplification
+  # d_adult_females
+export_cva_warps(
+  coords_gpa = coords, meta_df = meta_df, dataset_dir = outdir,
+  ref_land = ref$ref_land, ref_gpa_spec = ref$ref_gpa, ref_mesh_obj = ref$ref_mesh,
+  range_mode = "quantile", q_lo = 0.05, q_hi = 0.95
+)
+  export_pca_warps(
+  coords_gpa   = coords,
+  dataset_dir  = outdir,
+  ref_land     = ref$ref_land,
+  ref_gpa_spec = ref$ref_gpa,
+  ref_mesh_obj = ref$ref_mesh,
+  ends = "observed",           # << key change
+  mode_obs = "quantile", q_lo = 0.05, q_hi = 0.95
+)
+
+
+} else {
+  export_cva_warps(
+  coords_gpa = coords, meta_df = meta_df, dataset_dir = outdir,
+  ref_land = ref$ref_land, ref_gpa_spec = ref$ref_gpa, ref_mesh_obj = ref$ref_mesh,
+  range_mode = "sd", warp_mag_sd = 4
+)
+  export_pca_warps(
+  coords_gpa   = coords,
+  dataset_dir  = outdir,
+  ref_land     = ref$ref_land,
+  ref_gpa_spec = ref$ref_gpa,
+  ref_mesh_obj = ref$ref_mesh,
+  ends = "observed",           # << key change
+  mode_obs = "quantile", q_lo = 0.05, q_hi = 0.95
+)
+
+}
+
+
+
+  # --- Allometry (always run) ---
+  safe_call(
+    run_allometry_11(coords, Csize, meta_df, allom_dir, sample_name,
+                     sex_cols = sex_cols, age_pal = age_ramp),
+    "Allometry block", outdir, stop_on_error = TRUE
+  )
+
+  list(sample = sample_name, gp = gp)
+}
+
+
+# Run PCA, CVA (Species/Subspecies), and Allometry for a subset and write
+# results INSIDE an existing parent dataset folder.
+run_subset_within_parent <- function(A_parent, meta_parent,
+                                     parent_sample_name, subset_label,
+                                     keep_idx_logical) {
+  stopifnot(length(dim(A_parent)) == 3, nrow(meta_parent) >= 1)
+
+  # keep indices by ID alignment
+  ids_all <- dimnames(A_parent)[[3]]
+  stopifnot(all(ids_all %in% meta_parent$ID))
+  meta_parent <- meta_parent[match(ids_all, meta_parent$ID), , drop = FALSE]
+
+  if (length(keep_idx_logical) != length(ids_all))
+    stop("keep_idx_logical length must match number of specimens in A_parent.")
+
+  # subset landmarks + metadata
+  keep_idx <- which(keep_idx_logical)
+  if (length(keep_idx) < 3) {
+    message("Subset '", subset_label, "' under '", parent_sample_name,
+            "' has < 3 specimens; skipping.")
+    return(invisible(NULL))
+  }
+  A_sub   <- A_parent[,, keep_idx, drop = FALSE]
+  meta_sub<- meta_parent[keep_idx, , drop = FALSE]
+
+  # folders: base_out / parent / subset_label
+  parent_dir <- file.path(base_out, parent_sample_name)
+  outdir     <- file.path(parent_dir, subset_label)
+  pca_dir    <- file.path(outdir, "PCA")
+  cva_dir    <- file.path(outdir, "CVA")
+  allom_dir  <- file.path(outdir, "Allometry")
+  ensure_dirs(outdir, pca_dir, cva_dir, allom_dir)
+
+  # GPA (same sliders)
+  gp <- gpagen(A_sub, curves = sliders, ProcD = FALSE, print.progress = TRUE, PrinAxes = FALSE)
+  coords <- gp$coords
+  Csize  <- gp$Csize
+  ids_gp <- dimnames(coords)[[3]]
+  meta_sub <- meta_sub[match(ids_gp, meta_sub$ID), , drop = FALSE]
+  rownames(meta_sub) <- meta_sub$ID
+
+  # PCA/CVA restricted to Species & Subspecies
+  safe_call(
+    run_pca_and_phylos_11(
+      coords, meta_sub, pca_dir, cva_dir, paste(parent_sample_name, subset_label, sep=" / "),
+      pal_species    = species_cols_master,
+      pal_subspecies = subspecies_cols_master,
+      pal_region     = region_cols,
+      pal_age        = age_ramp,
+      Tree_Species   = Tree_Species,
+      Tree_Subspecies= Tree_Subspecies,
+      add_age_pca_for_complete = FALSE,
+      only = c("species","subspecies")   # <-- restrict here
+    ),
+    paste0("PCA/CVAs subset: ", parent_sample_name, " -> ", subset_label),
+    outdir, stop_on_error = TRUE
+  )
+
+  # Allometry (standard)
+  safe_call(
+    run_allometry_11(coords, Csize, meta_sub, allom_dir,
+                     sample_name = paste0(parent_sample_name, "_", gsub("\\s+","_", subset_label)),
+                     sex_cols = sex_cols, age_pal = age_ramp),
+    paste0("Allometry subset: ", parent_sample_name, " -> ", subset_label),
+    outdir, stop_on_error = TRUE
+  )
+
+  invisible(list(outdir = outdir, n = length(keep_idx)))
+
+# --- inside run_subset_within_parent(), after GPA and plotting ---
+
+ref <- choose_ref_for_warps(
+  sample_name            = parent_sample_name,
+  coords_gpa             = coords,
+  A_complete             = A_complete,
+  coords_complete_gpa    = COORDS_COMPLETE_GPA
+)
+
+dataset_label_subset <- paste(parent_sample_name, subset_label)
+
+# CVA warps (use valid range_mode)
+export_cva_warps(
+  coords_gpa    = coords,
+  meta_df       = meta_sub,
+  dataset_dir   = outdir,
+  ref_land      = ref$ref_land,
+  ref_gpa_spec  = ref$ref_gpa,
+  ref_mesh_obj  = ref$ref_mesh,
+  group_by      = c("species","subspecies"),
+  range_mode    = "minmax",          # <-- was "range" (invalid here)
+  dataset_label = dataset_label_subset
+)
+
+# PCA warps (range is OK here; or use quantile with q_lo/q_hi)
+export_pca_warps(
+  coords_gpa    = coords,
+  dataset_dir   = outdir,
+  ref_land      = ref$ref_land,
+  ref_gpa_spec  = ref$ref_gpa,
+  ref_mesh_obj  = ref$ref_mesh,
+  ends          = "reconstruct",
+  mode_rec      = "range",           # or "sd" with warp_mag_sd, or "quantile"
+  warp_mag_sd   = 2,
+  dataset_label = dataset_label_subset
+)
+
+
+}
+
+# --- helpers (only add if you don’t already have them) -----------------
+normalize_age_adult_dual <- function(Age){
+  ax <- toupper(trimws(as.character(Age)))
+  ax[!(ax %in% c("E","F","G","H","I","X"))] <- NA
+  list(
+    plot     = factor(ax, levels = c("E","F","G","H","I","X")),
+    pairwise = factor(replace(ax, ax=="X", NA), levels = c("E","F","G","H","I"))
+  )
+}
+make_hulls_df <- function(df, group_col, x_col, y_col){
+  if (!nrow(df)) return(df[0,])
+  tmp <- df[, c(group_col,x_col,y_col)]
+  names(tmp) <- c("grp","x","y")
+  pieces <- lapply(split(tmp, tmp$grp, drop = TRUE), function(d){
+    if (nrow(d) < 3 || any(!is.finite(d$x) | !is.finite(d$y))) return(NULL)
+    d[chull(d$x, d$y), , drop = FALSE]
+  })
+  out <- do.call(rbind, pieces); if (is.null(out)) tmp[0,] else out
+}
+
+# --- FIXED unified subset runner --------------------------------------
+run_allometry_adults_subset <- function(
+  A_complete, meta_complete, sex = c("M","F","MF"), base_out_dir = base_out
+){
+  sex <- toupper(as.character(sex[1]))
+  stopifnot(sex %in% c("M","F","MF"))
+
+  # where to write
+  parent_dir <- file.path(base_out_dir, "a_complete")
+  if (sex == "M")  subfolder <- "Males adults"
+  if (sex == "F")  subfolder <- "Females adults"
+  if (sex == "MF") subfolder <- "Adults (M+F)"
+  outdir_ad <- file.path(parent_dir, "Allometry", subfolder)
+  ensure_dirs(outdir_ad)
+
+  # filter by sex
+  ids_all <- dimnames(A_complete)[[3]]
+  mm <- meta_complete[match(ids_all, meta_complete$ID), , drop = FALSE]
+
+  if (sex == "MF"){
+    keep_sx <- !is.na(mm$Sex) & toupper(as.character(mm$Sex)) %in% c("M","F")
+  } else {
+    keep_sx <- !is.na(mm$Sex) & toupper(as.character(mm$Sex)) == sex
+  }
+  if (sum(keep_sx) < 4L){
+    writeLines(sprintf("Not enough specimens after sex filter (%s).", subfolder),
+               file.path(outdir_ad, "Allometry_notice.txt"))
+    return(invisible(NULL))
+  }
+
+  A_sub    <- A_complete[,, keep_sx, drop = FALSE]
+  meta_sub <- mm[keep_sx, , drop = FALSE]; rownames(meta_sub) <- meta_sub$ID
+
+  # GPA
+  gp <- gpagen(A_sub, curves = sliders, ProcD = FALSE, print.progress = TRUE, PrinAxes = FALSE)
+  coords <- gp$coords; Csize <- gp$Csize
+  ids_gp <- dimnames(coords)[[3]]
+  meta_sub <- meta_sub[match(ids_gp, meta_sub$ID), , drop = FALSE]
+  stopifnot(all(meta_sub$ID == ids_gp))
+
+  # allometry frame
+  df <- data.frame(logCS = log(Csize))
+  pc <- geomorph::gm.prcomp(coords)
+  df$Axis1 <- as.numeric(pc$x[,1])
+
+  # multivariate allometry R² (Procrustes)
+  gdf <- geomorph::geomorph.data.frame(coords = coords, Csize = Csize)
+  fit_allo <- geomorph::procD.lm(coords ~ log(Csize), data = gdf, iter = 9999, print.progress = FALSE)
+  sm <- summary(fit_allo)
+  R2_mv <- if (!is.null(sm$Rsq)) as.numeric(sm$Rsq) else {
+    tab <- sm$table
+    if (!is.null(tab) && "SS" %in% colnames(tab)) {
+      as.numeric(tab["log(Csize)","SS"]) / sum(as.numeric(tab[,"SS"]))
+    } else NA_real_
+  }
+  writeLines(sprintf("Multivariate R^2 (shape ~ logCS): %.4f", R2_mv),
+             file.path(outdir_ad, "Allometry_shape_vs_size_R2.txt"))
+  sink(file.path(outdir_ad, "Allometry_shape_vs_size_summary.txt")); print(sm); sink()
+
+  # Age normalization: E–I + X for plots; E–I for pairwise
+  ag <- normalize_age_adult_dual(meta_sub$Age)
+  Age_plot <- ag$plot
+  Age_pw   <- ag$pairwise
+
+  # counts
+  writeLines(c(
+    sprintf("%s — age counts", subfolder),
+    "Age_plot (E–I + X):",
+    capture.output(print(table(Age_plot, useNA = "ifany"))),
+    "Age_pairwise (E–I only):",
+    capture.output(print(table(Age_pw,   useNA = "ifany")))
+  ), file.path(outdir_ad, "Allometry_Age_counts.txt"))
+
+  # plot (E–I + X)
+  dfa <- df[!is.na(Age_plot), , drop = FALSE]
+  if (nrow(dfa)){
+    dfa$Age <- droplevels(Age_plot[!is.na(Age_plot)])
+    hulls <- make_hulls_df(
+      data.frame(Age = dfa$Age, logCS = dfa$logCS, Axis1 = dfa$Axis1),
+      "Age","logCS","Axis1"
+    )
+    age_cols_plot <- c(age_ramp, X = "#BDBDBD")  # assumes age_ramp named E..I
+    p_age <- ggplot2::ggplot(dfa, ggplot2::aes(logCS, Axis1, color = Age)) +
+      ggplot2::geom_polygon(
+        data = hulls,
+        ggplot2::aes(x = x, y = y, group = grp, fill = grp),
+        alpha = 0.10, inherit.aes = FALSE, linewidth = 0.35, color = NA
+      ) +
+      ggplot2::geom_point(pch = 19, size = 2.6, alpha = 0.95) +
+      ggplot2::geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 0.8) +
+      ggplot2::scale_color_manual(values = age_cols_plot, drop = FALSE) +
+      ggplot2::scale_fill_manual(values  = age_cols_plot, drop = FALSE) +
+      ggplot2::theme_light() +
+      ggplot2::xlab("log(CS)") + ggplot2::ylab("Allometric axis (PC1 proxy)")
+    ggplot2::ggsave(file.path(outdir_ad, "Allometry_logCS_byAge.jpg"),
+                    p_age, dpi = 600, width = 10, height = 5)
+  } else {
+    writeLines("No valid Age for plotting (after adult normalization).",
+               file.path(outdir_ad, "Allometry_Age_notice.txt"))
+  }
+
+  # pairwise (E–I only) — always try to write
+  ok_idx <- !is.na(Age_pw)
+  if (any(ok_idx)) {
+    write_pairwise_excel(
+      df[ok_idx, c("logCS","Axis1"), drop = FALSE],
+      droplevels(Age_pw[ok_idx]),
+      file.path(outdir_ad, "Allometry_pairwise_byAge.xlsx"),
+      iter = 9999
+    )
+  } else {
+    writeLines("No valid E–I classes with data for pairwise.",
+               file.path(outdir_ad, "Allometry_Age_pairwise_notice.txt"))
+  }
+
+  invisible(list(outdir = outdir_ad, n = dim(A_sub)[3], R2 = R2_mv))
+}
+
+
+run_allometry_complete_adults_both <- function(A_complete, meta_complete, base_out_dir = base_out){
+  parent_dir   <- file.path(base_out_dir, "a_complete")
+  outdir_ad    <- file.path(parent_dir, "Allometry", "Adults (M+F)")
+  ensure_dirs(outdir_ad)
+
+  # keep Sex = M/F only (drop NA/other), then normalize Age to E–I + X
+  ids_all <- dimnames(A_complete)[[3]]
+  mm <- meta_complete[match(ids_all, meta_complete$ID), , drop = FALSE]
+  keep_sx <- !is.na(mm$Sex) & toupper(as.character(mm$Sex)) %in% c("M","F")
+  if (sum(keep_sx) < 4L) {
+    writeLines("Not enough M+F adults after sex filter.", file.path(outdir_ad,"Allometry_notice.txt"))
+    return(invisible(NULL))
+  }
+
+  A_ad    <- A_complete[,, keep_sx, drop = FALSE]
+  meta_ad <- mm[keep_sx, , drop = FALSE]
+  rownames(meta_ad) <- meta_ad$ID
+
+  # GPA
+  gp <- gpagen(A_ad, curves = sliders, ProcD = FALSE, print.progress = TRUE, PrinAxes = FALSE)
+  coords_ad <- gp$coords
+  Csize_ad  <- gp$Csize
+  ids_gp    <- dimnames(coords_ad)[[3]]
+  meta_ad   <- meta_ad[match(ids_gp, meta_ad$ID), , drop = FALSE]
+
+  # Build the allometry frame
+  df <- data.frame(logCS = log(Csize_ad))
+  pca_tmp <- geomorph::gm.prcomp(coords_ad)
+  df$Axis1 <- as.numeric(pca_tmp$x[, 1])
+
+  ag <- normalize_age_adult_dual(meta_ad$Age)
+  Age_plot <- ag$plot
+  Age_pw   <- ag$pairwise
+
+  # counts
+  writeLines(c(
+    "Adults (M+F) — age counts",
+    "Age_plot (E–I + X):",
+    capture.output(print(table(Age_plot, useNA = "ifany"))),
+    "Age_pairwise (E–I only):",
+    capture.output(print(table(Age_pw,   useNA = "ifany")))
+  ), file.path(outdir_ad, "Allometry_Age_counts.txt"))
+
+  # Pairwise Excel (E–I only) — this is the file you were missing
+  ok_idx <- !is.na(Age_pw)
+  if (any(ok_idx)) {
+    write_pairwise_excel(
+      df[ok_idx, c("logCS","Axis1"), drop = FALSE],
+      droplevels(Age_pw[ok_idx]),
+      file.path(outdir_ad, "Allometry_pairwise_byAge.xlsx"),
+      iter = 9999
+    )
+  } else {
+    writeLines("No valid E–I classes with data for pairwise.",
+               file.path(outdir_ad, "Allometry_Age_pairwise_notice.txt"))
+  }
+
+  # Optional: also drop a quick plot like above if you want (reuse the code block)
+  invisible(list(outdir = outdir_ad, n = dim(A_ad)[3]))
+}
+
+
+############################################################
+## (11) Run ALL samples + report
+############################################################
+res_complete <- run_sample(A_complete, meta_complete, "a_complete")
+res_adults   <- run_sample(A_adults,   meta_adults,   "b_adults")
+res_males    <- run_sample(A_ad_males, meta_males,    "c_adult_males")
+res_females  <- run_sample(A_ad_fem,   meta_females,  "d_adult_females")
+
+# ---- Allometry-only subdatasets of COMPLETE (include juveniles) ----
+run_allometry_only_complete_by_sex(A_complete, meta_complete, sex_char = "M", base_out_dir = base_out)
+run_allometry_only_complete_by_sex(A_complete, meta_complete, sex_char = "F", base_out_dir = base_out)
+
+
+# Adult Females → South
+run_subset_within_parent(
+  A_parent = A_ad_fem,
+  meta_parent = meta_females,
+  parent_sample_name = "d_adult_females",
+  subset_label = "Adult Females South",
+  keep_idx_logical = (as.character(meta_females$Region[match(dimnames(A_ad_fem)[[3]], meta_females$ID)]) == "South")
+)
+
+# Adult Females → North
+run_subset_within_parent(
+  A_parent = A_ad_fem,
+  meta_parent = meta_females,
+  parent_sample_name = "d_adult_females",
+  subset_label = "Adult Females North",
+  keep_idx_logical = (as.character(meta_females$Region[match(dimnames(A_ad_fem)[[3]], meta_females$ID)]) == "North")
+)
+
+# Adult Males → South
+run_subset_within_parent(
+  A_parent = A_ad_males,
+  meta_parent = meta_males,
+  parent_sample_name = "c_adult_males",
+  subset_label = "Adult Males South",
+  keep_idx_logical = (as.character(meta_males$Region[match(dimnames(A_ad_males)[[3]], meta_males$ID)]) == "South")
+)
+
+# Adult Males → North
+run_subset_within_parent(
+  A_parent = A_ad_males,
+  meta_parent = meta_males,
+  parent_sample_name = "c_adult_males",
+  subset_label = "Adult Males North",
+  keep_idx_logical = (as.character(meta_males$Region[match(dimnames(A_ad_males)[[3]], meta_males$ID)]) == "North")
+)
+
+# Adults per sex
+run_allometry_adults_subset(A_complete, meta_complete, "M")
+run_allometry_adults_subset(A_complete, meta_complete, "F")
+
+# Adults M+F together
+run_allometry_adults_subset(A_complete, meta_complete, "MF")
+
+
+
+writeLines(capture.output(sessionInfo()), file.path(base_out, "sessionInfo.txt"))
+cat("\n== a_complete ==\n");      print(list.files(file.path(base_out, "a_complete"),      full.names = TRUE))
+cat("\n== b_adults ==\n");        print(list.files(file.path(base_out, "b_adults"),        full.names = TRUE))
+cat("\n== c_adult_males ==\n");   print(list.files(file.path(base_out, "c_adult_males"),   full.names = TRUE))
+cat("\n== d_adult_females ==\n"); print(list.files(file.path(base_out, "d_adult_females"), full.names = TRUE))
+cat("\n✅ Finished. Outputs per sample are under:\n", base_out, "\n")
